@@ -1,0 +1,9 @@
+# Binaries
+/storm_api
+/api
+/migrate
+/seed
+
+# Go build/test artifacts
+*.test
+*.out
