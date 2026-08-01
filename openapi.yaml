@@ -159,6 +159,49 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/StoredEvent" }
 
+  /v1/outbox/dead:
+    get:
+      summary: List the dead-letter queue (terminal delivery failures)
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, default: 100, maximum: 500 }
+      responses:
+        "200":
+          description: Notifications that exhausted their retries.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+                  dead_letters:
+                    type: array
+                    items: { $ref: "#/components/schemas/OutboxRecord" }
+
+  /v1/outbox/{notification_id}:
+    get:
+      summary: Fetch one outbox record by its stable notification identity
+      parameters:
+        - in: path
+          name: notification_id
+          required: true
+          schema: { type: string }
+          description: >
+            The full identity, e.g. cn-met/rainstorm-2026-0801-hb-001/4. It
+            contains slashes, matched as a trailing wildcard path segment.
+      responses:
+        "200":
+          description: The outbox record
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OutboxRecord" }
+        "404":
+          description: Unknown notification
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
 components:
   schemas:
     IngestRequest:
@@ -209,7 +252,11 @@ components:
         returned unchanged.
       properties:
         id: { type: integer, format: int64 }
-        event_id: { type: integer, format: int64 }
+        event_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: Null for synthetic (event-less) notifications.
         notification_id:
           type: string
           description: >
@@ -217,18 +264,38 @@ components:
             cn-met/rainstorm-2026-0801-hb-001/4. It never changes across
             redelivery, so an idempotent downstream can de-duplicate.
           example: cn-met/rainstorm-2026-0801-hb-001/4
-        topic: { type: string, enum: [warning.applied, warning.superseded] }
+        topic: { type: string, example: warning.applied }
         payload:
           type: object
           additionalProperties: true
+        status:
+          type: string
+          enum: [pending, delivered, dead]
+          description: >
+            Delivery lifecycle: pending (owed), delivered (terminal success),
+            dead (terminal failure after max_attempts).
         attempts: { type: integer }
+        max_attempts: { type: integer }
         dispatched_at:
           type: string
           format: date-time
           nullable: true
           description: Set only after a successful downstream delivery.
+        dead_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Set when the row entered the terminal dead state.
+        lease_expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: >
+            While in the future, the row is leased by claimed_by and cannot be
+            claimed by another worker; takeover is possible only after expiry.
         next_attempt_at: { type: string, format: date-time }
         last_error: { type: string }
+        claimed_by: { type: string }
         created_at: { type: string, format: date-time }
     StoredEvent:
       type: object

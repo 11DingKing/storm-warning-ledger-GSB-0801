@@ -65,19 +65,36 @@ type IngestResult struct {
 	Current *domain.CurrentState `json:"current"`
 }
 
+// OutboxStatus is the delivery lifecycle state of an outbox notification.
+type OutboxStatus string
+
+const (
+	// OutboxPending: still owed to the downstream; eligible for (re)delivery.
+	OutboxPending OutboxStatus = "pending"
+	// OutboxDelivered: delivered exactly once (terminal, success).
+	OutboxDelivered OutboxStatus = "delivered"
+	// OutboxDead: exceeded max_attempts consecutive failures (terminal, failure).
+	OutboxDead OutboxStatus = "dead"
+)
+
 // OutboxRecord is one notification queued for downstream delivery. Its
 // NotificationID ("<source>/<external_id>/<revision>") is a stable identity that
 // survives crashes and redelivery, so an idempotent downstream can de-duplicate.
 type OutboxRecord struct {
 	ID             int64          `json:"id"`
-	EventID        int64          `json:"event_id"`
+	EventID        *int64         `json:"event_id,omitempty"`
 	NotificationID string         `json:"notification_id"`
 	Topic          string         `json:"topic"`
 	Payload        map[string]any `json:"payload"`
+	Status         OutboxStatus   `json:"status"`
 	Attempts       int            `json:"attempts"`
+	MaxAttempts    int            `json:"max_attempts"`
 	DispatchedAt   *time.Time     `json:"dispatched_at,omitempty"`
+	DeadAt         *time.Time     `json:"dead_at,omitempty"`
+	LeaseExpiresAt *time.Time     `json:"lease_expires_at,omitempty"`
 	NextAttemptAt  time.Time      `json:"next_attempt_at"`
 	LastError      string         `json:"last_error,omitempty"`
+	ClaimedBy      string         `json:"claimed_by,omitempty"`
 	CreatedAt      time.Time      `json:"created_at"`
 }
 
@@ -312,27 +329,32 @@ func currentTx(ctx context.Context, q querier, source, externalID string) (*doma
 
 // outboxColumns is the canonical projection order for an outbox row, shared by
 // every place that materializes an OutboxRecord.
-const outboxColumns = `id, event_id, notification_id, topic, payload, attempts,
-	dispatched_at, next_attempt_at, last_error, created_at`
+const outboxColumns = `id, event_id, notification_id, topic, payload, status,
+	attempts, max_attempts, dispatched_at, dead_at, lease_expires_at,
+	next_attempt_at, last_error, claimed_by, created_at`
 
 // OutboxColumns exposes the canonical outbox projection order to other packages
 // (e.g. the dispatcher) so their SELECTs line up with ScanOutboxRows.
 const OutboxColumns = outboxColumns
 
 // scanOutbox reads one outbox row from a pgx.Row using outboxColumns order,
-// tolerating the nullable dispatched_at / last_error columns.
+// tolerating the nullable columns.
 func scanOutbox(row pgx.Row) (*OutboxRecord, error) {
 	var ob OutboxRecord
 	var raw []byte
-	var lastErr *string
+	var lastErr, claimedBy *string
 	if err := row.Scan(
-		&ob.ID, &ob.EventID, &ob.NotificationID, &ob.Topic, &raw, &ob.Attempts,
-		&ob.DispatchedAt, &ob.NextAttemptAt, &lastErr, &ob.CreatedAt,
+		&ob.ID, &ob.EventID, &ob.NotificationID, &ob.Topic, &raw, &ob.Status,
+		&ob.Attempts, &ob.MaxAttempts, &ob.DispatchedAt, &ob.DeadAt, &ob.LeaseExpiresAt,
+		&ob.NextAttemptAt, &lastErr, &claimedBy, &ob.CreatedAt,
 	); err != nil {
 		return nil, err
 	}
 	if lastErr != nil {
 		ob.LastError = *lastErr
+	}
+	if claimedBy != nil {
+		ob.ClaimedBy = *claimedBy
 	}
 	if err := json.Unmarshal(raw, &ob.Payload); err != nil {
 		return nil, fmt.Errorf("decode outbox payload: %w", err)
@@ -344,6 +366,12 @@ func scanOutbox(row pgx.Row) (*OutboxRecord, error) {
 // positioned on a row selected with OutboxColumns. Exported for the dispatcher.
 func ScanOutboxRows(rows pgx.Rows) (*OutboxRecord, error) {
 	return scanOutbox(rows)
+}
+
+// ScanOutboxSingle materializes one OutboxRecord from a single pgx.Row selected
+// with OutboxColumns (e.g. an UPDATE ... RETURNING). Exported for the dispatcher.
+func ScanOutboxSingle(row pgx.Row) (*OutboxRecord, error) {
+	return scanOutbox(row)
 }
 
 // OutboxByNotificationID returns the outbox record for a stable notification
@@ -358,6 +386,57 @@ func (s *Store) OutboxByNotificationID(ctx context.Context, notificationID strin
 		return nil, fmt.Errorf("query outbox by notification: %w", err)
 	}
 	return ob, nil
+}
+
+// EnqueueNotification inserts a standalone (event-less) notification into the
+// outbox, e.g. a synthetic "poison" message with a low max_attempts so it can be
+// driven into the dead-letter state deterministically. It is idempotent on
+// notification_id: a repeat returns the existing row unchanged.
+func (s *Store) EnqueueNotification(ctx context.Context, notificationID, topic string, payload map[string]any, maxAttempts int) (*OutboxRecord, error) {
+	if maxAttempts <= 0 {
+		maxAttempts = 8
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal payload: %w", err)
+	}
+	ob, err := scanOutbox(s.pool.QueryRow(ctx, `
+		INSERT INTO warning_outbox (notification_id, topic, payload, max_attempts)
+		VALUES ($1,$2,$3,$4)
+		ON CONFLICT (notification_id) DO UPDATE SET notification_id = warning_outbox.notification_id
+		RETURNING `+outboxColumns,
+		notificationID, topic, raw, maxAttempts,
+	))
+	if err != nil {
+		return nil, fmt.Errorf("enqueue notification: %w", err)
+	}
+	return ob, nil
+}
+
+// DeadLetters returns notifications that have entered the terminal dead state,
+// most-recent first. This is the queryable "failure archive" for operators.
+func (s *Store) DeadLetters(ctx context.Context, limit int) ([]OutboxRecord, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+outboxColumns+`
+		 FROM warning_outbox WHERE status='dead'
+		 ORDER BY dead_at DESC, id DESC
+		 LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query dead letters: %w", err)
+	}
+	defer rows.Close()
+	var out []OutboxRecord
+	for rows.Next() {
+		rec, err := scanOutbox(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *rec)
+	}
+	return out, rows.Err()
 }
 
 // eventByRevisionTx fetches the single stored event for a natural key, or nil.

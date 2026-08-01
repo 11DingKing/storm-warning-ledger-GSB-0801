@@ -49,19 +49,36 @@ Guarantees and how they are enforced:
 The outbox is drained by one or more **workers** (`cmd/worker`). Each notification
 carries a **stable identity** `notification_id = "<source>/<external_id>/<revision>"`
 (e.g. `cn-met/rainstorm-2026-0801-hb-001/4`) that never changes across redelivery.
+Every row has an explicit `status` — `pending` → `delivered` (terminal success)
+or `dead` (terminal failure) — plus `attempts`, `max_attempts`, and a lease.
 
-- **No double-claim** — a worker claims a due row with
-  `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1`, holding the row lock for the whole
-  processing transaction. A row in flight in one worker is invisible to another,
-  so two workers can never claim the same row simultaneously.
-- **Deliver-before-mark** — the worker delivers to the downstream *first*, then
-  writes `dispatched_at` in the same transaction. If the process crashes after
-  the downstream received the message but before that local commit, the
-  transaction rolls back: `dispatched_at` stays `NULL` and the row is redelivered
-  later **with the same `notification_id`**. Downstreams treat that id as an
-  idempotency key (sent as the `Idempotency-Key` header).
-- **Retry with backoff** — a failed delivery records `last_error`, increments
-  `attempts`, and pushes `next_attempt_at` out by an exponential, capped backoff.
+Two claim models are implemented in `internal/dispatch`:
+
+- **`ProcessOne` (row-lock)** — claims with `SELECT ... FOR UPDATE SKIP LOCKED
+  LIMIT 1`, holding the lock for the whole transaction. Two workers can never
+  claim the same row at once; a crashed worker frees the row instantly.
+- **`ProcessOneLeased` (committed lease)** — used by `cmd/worker`. The worker
+  first *commits* a lease (`lease_expires_at = now + LeaseTTL`, `claimed_by`),
+  then delivers, then commits the terminal state. Because the lease is committed,
+  a worker that dies mid-delivery leaves the row **leased and un-claimable until
+  the lease expires** — at which point a *second* worker legitimately takes over.
+  This is the real distributed-ownership handoff.
+
+Guarantees:
+
+- **No double-claim / lease takeover** — while a lease is valid the row is
+  invisible to other workers; only after `lease_expires_at` may another worker
+  claim it. The result is exactly one `delivered` business notification even
+  across a crash + handoff.
+- **Deliver-before-mark** — delivery to the downstream happens *before* the
+  terminal state is committed. A crash after downstream receipt but before that
+  commit leaves the row `pending` (lease held), so the takeover worker redelivers
+  with the same `notification_id` (sent as the `Idempotency-Key` header).
+- **Retry with backoff → dead-letter** — a failed delivery records `last_error`,
+  increments `attempts`, and reschedules with exponential capped backoff. After
+  `max_attempts` consecutive failures the row moves to the terminal **`dead`**
+  state (`dead_at` set) and is never delivered again — but stays queryable via
+  `GET /v1/outbox/dead`.
 
 Layers are kept separate:
 
@@ -125,6 +142,9 @@ What the integration tests prove against real PostgreSQL:
 | `TestDuplicateRevision4ReturnsFirst`        | Re-submitting revision 4 returns the first event + first outbox record; nothing new appended. |
 | `TestConcurrentWorkersNoDoubleClaim`        | Two workers drain the queue with no row claimed twice; each delivered exactly once. |
 | `TestCrashAfterReceiptRedeliversSameIdentity` | Crash after downstream receipt / before `dispatched_at` commit → redelivery with the same notification identity. |
+| `TestLeaseTakeoverAfterExpiry`              | w1 leases + delivers rev4 then crashes; w2 cannot claim until the lease expires, then takes over → exactly one `delivered` notification. |
+| `TestPoisonDeadLettersAfterThreeFailures`   | `delivery-poison-01` fails 3× and lands in the queryable terminal `dead` state; never re-claimed. |
+| `TestAsOfImmuneToDeliveryRetries`           | `as_of` at the rev3-lift and rev4-recovery instants is byte-identical before and after heavy dispatch churn (retries + a dead-letter). |
 
 ## Run the dispatch workers
 
@@ -170,6 +190,8 @@ Full contract in [`openapi.yaml`](./openapi.yaml).
 | `GET  /v1/warnings/{source}/{external_id}?as_of=<RFC3339>` | Point-in-time state.           |
 | `GET  /v1/warnings/{source}/{external_id}/events` | Full append-only history.              |
 | `GET  /v1/warnings?status=&severity=&region_code=&limit=&offset=` | Search current states. |
+| `GET  /v1/outbox/dead`                          | List the dead-letter queue (terminal failures). |
+| `GET  /v1/outbox/{notification_id}`             | Fetch one notification by its stable identity. |
 
 Example ingest:
 

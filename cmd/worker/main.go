@@ -85,15 +85,21 @@ func main() {
 			return
 		case <-ticker.C:
 			for {
-				res, err := d.ProcessOne(ctx, nil)
+				// Leased processing: a committed lease means a crashed worker's
+				// row is taken over by another worker only after the lease
+				// expires, and repeated failures dead-letter the notification.
+				res, err := d.ProcessOneLeased(ctx, nil)
 				if err != nil {
 					log.Printf("worker %s: process error: %v", workerID, err)
 				}
 				if !res.Claimed {
 					break // nothing due right now
 				}
-				if res.Delivered {
+				switch {
+				case res.Delivered:
 					log.Printf("worker %s: delivered %s (attempt %d)", workerID, res.NotificationID, res.Attempts)
+				case res.DeadLettered:
+					log.Printf("worker %s: dead-lettered %s after %d attempts", workerID, res.NotificationID, res.Attempts)
 				}
 			}
 		}

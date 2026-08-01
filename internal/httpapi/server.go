@@ -38,6 +38,9 @@ func (s *Server) routes() {
 	// state, point-in-time state, and full history.
 	s.mux.HandleFunc("GET /v1/warnings/{source}/{external_id}", s.handleCurrent)
 	s.mux.HandleFunc("GET /v1/warnings/{source}/{external_id}/events", s.handleEvents)
+	// Outbox introspection: the dead-letter queue and lookup by identity.
+	s.mux.HandleFunc("GET /v1/outbox/dead", s.handleDeadLetters)
+	s.mux.HandleFunc("GET /v1/outbox/{notification_id...}", s.handleOutboxByID)
 }
 
 // ingestRequest is the wire form of an inbound upstream message.
@@ -148,6 +151,43 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		"external_id": externalID,
 		"events":      events,
 	})
+}
+
+// handleDeadLetters returns the terminal dead-letter queue: notifications that
+// exhausted their retries. This is the queryable failure archive.
+func (s *Server) handleDeadLetters(w http.ResponseWriter, r *http.Request) {
+	limit := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	dead, err := s.store.DeadLetters(r.Context(), limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "query_failed", err.Error())
+		return
+	}
+	if dead == nil {
+		dead = []store.OutboxRecord{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"count": len(dead), "dead_letters": dead})
+}
+
+// handleOutboxByID returns a single outbox record by its stable notification
+// identity (which itself contains slashes, hence the {notification_id...}
+// wildcard segment).
+func (s *Server) handleOutboxByID(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("notification_id")
+	rec, err := s.store.OutboxByNotificationID(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "query_failed", err.Error())
+		return
+	}
+	if rec == nil {
+		writeError(w, http.StatusNotFound, "not_found", "unknown notification")
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
 }
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
