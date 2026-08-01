@@ -1,0 +1,246 @@
+openapi: 3.0.3
+info:
+  title: Storm Warning Ledger API
+  version: 1.0.0
+  description: |
+    多省应急平台暴雨/雷暴大风/冰雹预警生命周期后端。
+
+    核心语义：
+    - **append-only 事件流**：每次修订/解除都是一条新事件，历史事件不可改、不可删；
+    - **幂等**：同一 `source + external_id + revision` 重复提交返回 `200 replayed`，不产生新写入；
+    - **修订号驱动**：更高修订（含 `cancelled` 解除）成为当前有效状态；更低修订的迟到消息只留痕（`201 late`），不回退当前状态；
+    - **冲突保护**：三元组相同但内容不同的消息返回 `409`；
+    - **事务性 outbox**：事件、当前状态、通知在同一事务提交，要么全部可见要么全部回滚；
+    - **as_of 历史**：可按任意时刻重建当时的有效状态。
+tags:
+  - name: warnings
+paths:
+  /healthz:
+    get:
+      summary: 存活探针
+      responses:
+        "200":
+          description: 服务可用
+  /v1/warnings/events:
+    post:
+      tags: [warnings]
+      summary: 写入一条预警修订/解除消息
+      description: |
+        返回 `outcome`：
+        - `applied`：新事件成为当前有效状态（HTTP 201）
+        - `late`：迟到事件已留痕，当前状态未变（HTTP 201）
+        - `replayed`：完全相同的消息重复提交，幂等重放（HTTP 200）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WarningInput"
+      responses:
+        "200":
+          description: 幂等重放（replayed）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AppendResult"
+        "201":
+          description: 新事件已写入（applied / late）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AppendResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: 同一 revision 已存在但内容不同
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: 输入校验失败，fields 给出字段级错误
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /v1/warnings/{source}/{external_id}:
+    get:
+      tags: [warnings]
+      summary: 查询事件序列的当前有效状态；带 as_of 时重建该时刻的历史状态
+      parameters:
+        - $ref: "#/components/parameters/Source"
+        - $ref: "#/components/parameters/ExternalId"
+        - name: as_of
+          in: query
+          required: false
+          description: RFC3339 时间戳；返回该时刻已收到事件中修订号最大者的状态
+          schema:
+            type: string
+            format: date-time
+          example: "2026-08-01T10:30:00+08:00"
+      responses:
+        "200":
+          description: 有效状态
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WarningState"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/warnings/{source}/{external_id}/events:
+    get:
+      tags: [warnings]
+      summary: 查询事件序列的完整审计轨迹（含迟到留痕），按接收顺序稳定升序
+      parameters:
+        - $ref: "#/components/parameters/Source"
+        - $ref: "#/components/parameters/ExternalId"
+      responses:
+        "200":
+          description: 事件列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/WarningEvent"
+  /v1/warnings:
+    get:
+      tags: [warnings]
+      summary: 检索当前有效预警（keyset 分页，按 (source, external_id) 稳定升序）
+      parameters:
+        - name: region_code
+          in: query
+          schema: { type: string, example: "420000" }
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/Status" }
+        - name: severity
+          in: query
+          schema: { $ref: "#/components/schemas/Severity" }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - name: cursor
+          in: query
+          description: 上一页响应中的 next_cursor
+          schema: { type: string }
+      responses:
+        "200":
+          description: 当前预警列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  warnings:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/WarningState"
+                  next_cursor:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+components:
+  parameters:
+    Source:
+      name: source
+      in: path
+      required: true
+      schema: { type: string, example: cn-met }
+    ExternalId:
+      name: external_id
+      in: path
+      required: true
+      schema: { type: string, example: rainstorm-2026-0801-hb-001 }
+  responses:
+    BadRequest:
+      description: 请求参数非法
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: 事件序列不存在
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Severity:
+      type: string
+      enum: [blue, yellow, orange, red]
+    Status:
+      type: string
+      enum: [active, cancelled]
+    WarningInput:
+      type: object
+      required:
+        [source, external_id, revision, severity, status, region_code, issued_at, effective_at, expires_at]
+      properties:
+        source:
+          type: string
+          description: 上游来源标识
+          example: cn-met
+        external_id:
+          type: string
+          description: 上游事件 ID
+          example: rainstorm-2026-0801-hb-001
+        revision:
+          type: integer
+          minimum: 1
+          example: 2
+        severity:
+          $ref: "#/components/schemas/Severity"
+        status:
+          $ref: "#/components/schemas/Status"
+        region_code:
+          type: string
+          description: 地区编码（如 GB/T 2260 行政区划代码）
+          example: "420000"
+        headline:
+          type: string
+        description:
+          type: string
+        issued_at:
+          type: string
+          format: date-time
+        effective_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+    WarningEvent:
+      allOf:
+        - $ref: "#/components/schemas/WarningInput"
+        - type: object
+          properties:
+            id: { type: integer, format: int64 }
+            received_at: { type: string, format: date-time }
+    WarningState:
+      allOf:
+        - $ref: "#/components/schemas/WarningInput"
+        - type: object
+          properties:
+            last_event_id: { type: integer, format: int64 }
+            updated_at: { type: string, format: date-time }
+    AppendResult:
+      type: object
+      properties:
+        outcome:
+          type: string
+          enum: [applied, late, replayed]
+        event:
+          $ref: "#/components/schemas/WarningEvent"
+        current:
+          $ref: "#/components/schemas/WarningState"
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        fields:
+          type: object
+          additionalProperties: { type: string }
