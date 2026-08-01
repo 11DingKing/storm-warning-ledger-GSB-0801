@@ -21,11 +21,19 @@ const (
 	SeverityModerate Severity = "moderate"
 	SeveritySevere   Severity = "severe"
 	SeverityExtreme  Severity = "extreme"
+
+	// China's meteorological color-coded warning levels, accepted as first-class
+	// severities alongside the CAP-style words above. Blue < yellow < orange < red.
+	SeverityBlue   Severity = "blue"
+	SeverityYellow Severity = "yellow"
+	SeverityOrange Severity = "orange"
+	SeverityRed    Severity = "red"
 )
 
 func (s Severity) valid() bool {
 	switch s {
-	case SeverityMinor, SeverityModerate, SeveritySevere, SeverityExtreme:
+	case SeverityMinor, SeverityModerate, SeveritySevere, SeverityExtreme,
+		SeverityBlue, SeverityYellow, SeverityOrange, SeverityRed:
 		return true
 	default:
 		return false

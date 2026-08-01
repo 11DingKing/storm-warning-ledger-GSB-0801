@@ -61,7 +61,29 @@ type StoredEvent struct {
 type IngestResult struct {
 	Outcome Outcome              `json:"outcome"`
 	Event   *StoredEvent         `json:"event,omitempty"`
+	Outbox  *OutboxRecord        `json:"outbox,omitempty"`
 	Current *domain.CurrentState `json:"current"`
+}
+
+// OutboxRecord is one notification queued for downstream delivery. Its
+// NotificationID ("<source>/<external_id>/<revision>") is a stable identity that
+// survives crashes and redelivery, so an idempotent downstream can de-duplicate.
+type OutboxRecord struct {
+	ID             int64          `json:"id"`
+	EventID        int64          `json:"event_id"`
+	NotificationID string         `json:"notification_id"`
+	Topic          string         `json:"topic"`
+	Payload        map[string]any `json:"payload"`
+	Attempts       int            `json:"attempts"`
+	DispatchedAt   *time.Time     `json:"dispatched_at,omitempty"`
+	NextAttemptAt  time.Time      `json:"next_attempt_at"`
+	LastError      string         `json:"last_error,omitempty"`
+	CreatedAt      time.Time      `json:"created_at"`
+}
+
+// NotificationID builds the stable notification identity for an event.
+func NotificationID(source, externalID string, revision int) string {
+	return fmt.Sprintf("%s/%s/%d", source, externalID, revision)
 }
 
 // ErrInjectedFault is returned by a fault hook to force a mid-transaction
@@ -131,9 +153,21 @@ func (s *Store) Ingest(ctx context.Context, in domain.EventInput, afterEventBefo
 		&ev.RegionCodes, &rawPayload, &ev.ReceivedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		// Duplicate revision: nothing appended. Return the existing current
-		// state so callers still get a coherent view. Committing here releases
-		// the advisory lock cleanly.
+		// Duplicate revision: nothing appended. Re-submitting an already-seen
+		// revision must return the FIRST event and its FIRST outbox record
+		// unchanged — same notification identity, no new work. Committing here
+		// releases the advisory lock cleanly.
+		firstEvent, ferr := eventByRevisionTx(ctx, tx, in.Source, in.ExternalID, in.Revision)
+		if ferr != nil {
+			return IngestResult{}, ferr
+		}
+		var firstOutbox *OutboxRecord
+		if firstEvent != nil {
+			firstOutbox, ferr = outboxByEventTx(ctx, tx, firstEvent.ID)
+			if ferr != nil {
+				return IngestResult{}, ferr
+			}
+		}
 		current, cerr := currentTx(ctx, tx, in.Source, in.ExternalID)
 		if cerr != nil {
 			return IngestResult{}, cerr
@@ -141,7 +175,7 @@ func (s *Store) Ingest(ctx context.Context, in domain.EventInput, afterEventBefo
 		if err := tx.Commit(ctx); err != nil {
 			return IngestResult{}, fmt.Errorf("commit duplicate: %w", err)
 		}
-		return IngestResult{Outcome: OutcomeDuplicate, Current: current}, nil
+		return IngestResult{Outcome: OutcomeDuplicate, Event: firstEvent, Outbox: firstOutbox, Current: current}, nil
 	}
 	if err != nil {
 		return IngestResult{}, fmt.Errorf("insert event: %w", err)
@@ -220,10 +254,14 @@ func (s *Store) Ingest(ctx context.Context, in domain.EventInput, afterEventBefo
 	if err != nil {
 		return IngestResult{}, fmt.Errorf("marshal outbox: %w", err)
 	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO warning_outbox (event_id, topic, payload) VALUES ($1,$2,$3)`,
-		ev.ID, topic, outboxPayload,
-	); err != nil {
+	notificationID := NotificationID(ev.Source, ev.ExternalID, ev.Revision)
+	outbox, err := scanOutbox(tx.QueryRow(ctx, `
+		INSERT INTO warning_outbox (event_id, notification_id, topic, payload)
+		VALUES ($1,$2,$3,$4)
+		RETURNING `+outboxColumns,
+		ev.ID, notificationID, topic, outboxPayload,
+	))
+	if err != nil {
 		return IngestResult{}, fmt.Errorf("insert outbox: %w", err)
 	}
 
@@ -236,7 +274,7 @@ func (s *Store) Ingest(ctx context.Context, in domain.EventInput, afterEventBefo
 		return IngestResult{}, fmt.Errorf("commit: %w", err)
 	}
 
-	return IngestResult{Outcome: outcome, Event: &ev, Current: current}, nil
+	return IngestResult{Outcome: outcome, Event: &ev, Outbox: outbox, Current: current}, nil
 }
 
 // Current returns the projected current state for a warning, or nil if unknown.
@@ -270,6 +308,96 @@ func currentTx(ctx context.Context, q querier, source, externalID string) (*doma
 		return nil, fmt.Errorf("query current: %w", err)
 	}
 	return &c, nil
+}
+
+// outboxColumns is the canonical projection order for an outbox row, shared by
+// every place that materializes an OutboxRecord.
+const outboxColumns = `id, event_id, notification_id, topic, payload, attempts,
+	dispatched_at, next_attempt_at, last_error, created_at`
+
+// OutboxColumns exposes the canonical outbox projection order to other packages
+// (e.g. the dispatcher) so their SELECTs line up with ScanOutboxRows.
+const OutboxColumns = outboxColumns
+
+// scanOutbox reads one outbox row from a pgx.Row using outboxColumns order,
+// tolerating the nullable dispatched_at / last_error columns.
+func scanOutbox(row pgx.Row) (*OutboxRecord, error) {
+	var ob OutboxRecord
+	var raw []byte
+	var lastErr *string
+	if err := row.Scan(
+		&ob.ID, &ob.EventID, &ob.NotificationID, &ob.Topic, &raw, &ob.Attempts,
+		&ob.DispatchedAt, &ob.NextAttemptAt, &lastErr, &ob.CreatedAt,
+	); err != nil {
+		return nil, err
+	}
+	if lastErr != nil {
+		ob.LastError = *lastErr
+	}
+	if err := json.Unmarshal(raw, &ob.Payload); err != nil {
+		return nil, fmt.Errorf("decode outbox payload: %w", err)
+	}
+	return &ob, nil
+}
+
+// ScanOutboxRows materializes one OutboxRecord from an already-advanced pgx.Rows
+// positioned on a row selected with OutboxColumns. Exported for the dispatcher.
+func ScanOutboxRows(rows pgx.Rows) (*OutboxRecord, error) {
+	return scanOutbox(rows)
+}
+
+// OutboxByNotificationID returns the outbox record for a stable notification
+// identity, or nil if none exists.
+func (s *Store) OutboxByNotificationID(ctx context.Context, notificationID string) (*OutboxRecord, error) {
+	ob, err := scanOutbox(s.pool.QueryRow(ctx,
+		`SELECT `+outboxColumns+` FROM warning_outbox WHERE notification_id=$1`, notificationID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query outbox by notification: %w", err)
+	}
+	return ob, nil
+}
+
+// eventByRevisionTx fetches the single stored event for a natural key, or nil.
+func eventByRevisionTx(ctx context.Context, q querier, source, externalID string, revision int) (*StoredEvent, error) {
+	var ev StoredEvent
+	var raw []byte
+	err := q.QueryRow(ctx, `
+		SELECT id, event_uid, source, external_id, revision, severity, status,
+		       issued_at, effective_at, expires_at, region_codes, payload, received_at
+		FROM warning_events
+		WHERE source=$1 AND external_id=$2 AND revision=$3`,
+		source, externalID, revision,
+	).Scan(
+		&ev.ID, &ev.EventUID, &ev.Source, &ev.ExternalID, &ev.Revision,
+		&ev.Severity, &ev.Status, &ev.IssuedAt, &ev.EffectiveAt, &ev.ExpiresAt,
+		&ev.RegionCodes, &raw, &ev.ReceivedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query event by revision: %w", err)
+	}
+	if err := json.Unmarshal(raw, &ev.Payload); err != nil {
+		return nil, fmt.Errorf("decode payload: %w", err)
+	}
+	return &ev, nil
+}
+
+// outboxByEventTx fetches the single outbox record for an event, or nil.
+func outboxByEventTx(ctx context.Context, q querier, eventID int64) (*OutboxRecord, error) {
+	ob, err := scanOutbox(q.QueryRow(ctx,
+		`SELECT `+outboxColumns+` FROM warning_outbox WHERE event_id=$1`, eventID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query outbox by event: %w", err)
+	}
+	return ob, nil
 }
 
 // AsOf reconstructs the effective state of a warning as it would have been known

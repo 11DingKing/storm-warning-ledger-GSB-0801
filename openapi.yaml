@@ -70,7 +70,7 @@ paths:
           schema: { type: string, enum: [active, updated, cancelled, expired] }
         - in: query
           name: severity
-          schema: { type: string, enum: [minor, moderate, severe, extreme] }
+          schema: { type: string, enum: [minor, moderate, severe, extreme, blue, yellow, orange, red] }
         - in: query
           name: region_code
           schema: { type: string }
@@ -177,7 +177,7 @@ components:
         source: { type: string, example: cma-guangdong }
         external_id: { type: string, example: GD-RAIN-2026-0007 }
         revision: { type: integer, minimum: 0, example: 1 }
-        severity: { type: string, enum: [minor, moderate, severe, extreme] }
+        severity: { type: string, enum: [minor, moderate, severe, extreme, blue, yellow, orange, red] }
         status: { type: string, enum: [active, updated, cancelled, expired] }
         issued_at: { type: string, format: date-time }
         effective_at: { type: string, format: date-time }
@@ -197,8 +197,39 @@ components:
           enum: [applied, superseded, duplicate]
         event:
           $ref: "#/components/schemas/StoredEvent"
+        outbox:
+          $ref: "#/components/schemas/OutboxRecord"
         current:
           $ref: "#/components/schemas/CurrentState"
+    OutboxRecord:
+      type: object
+      description: >
+        A notification queued for at-least-once downstream delivery. On a
+        duplicate ingest the FIRST event and this FIRST outbox record are
+        returned unchanged.
+      properties:
+        id: { type: integer, format: int64 }
+        event_id: { type: integer, format: int64 }
+        notification_id:
+          type: string
+          description: >
+            Stable delivery identity "<source>/<external_id>/<revision>", e.g.
+            cn-met/rainstorm-2026-0801-hb-001/4. It never changes across
+            redelivery, so an idempotent downstream can de-duplicate.
+          example: cn-met/rainstorm-2026-0801-hb-001/4
+        topic: { type: string, enum: [warning.applied, warning.superseded] }
+        payload:
+          type: object
+          additionalProperties: true
+        attempts: { type: integer }
+        dispatched_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Set only after a successful downstream delivery.
+        next_attempt_at: { type: string, format: date-time }
+        last_error: { type: string }
+        created_at: { type: string, format: date-time }
     StoredEvent:
       type: object
       properties:

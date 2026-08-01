@@ -80,3 +80,59 @@ func Scenario() []Message {
 		},
 	}
 }
+
+// HB001Source / HB001ExternalID identify the Hebei rainstorm warning used by the
+// dispatch scenario below.
+const (
+	HB001Source     = "cn-met"
+	HB001ExternalID = "rainstorm-2026-0801-hb-001"
+)
+
+// HB001Lifecycle returns revisions 1..4 for cn-met/rainstorm-2026-0801-hb-001.
+// The lifecycle is: active (r1) → upgraded (r2) → cancelled/解除 (r3) →
+// REACTIVATED at the highest color level red (r4). Revision 4 reactivating does
+// NOT rewrite the revision-3 cancellation record; both remain in the append-only
+// log, and current state simply advances to revision 4.
+func HB001Lifecycle() []Message {
+	base := time.Date(2026, 8, 1, 2, 0, 0, 0, time.UTC) // 10:00 CST
+	regions := []string{"130100", "130600"}             // Shijiazhuang, Baoding
+	src, ext := HB001Source, HB001ExternalID
+
+	// revision 4 effective_at is fixed at 2026-08-01T10:15:00+08:00.
+	r4Effective := time.Date(2026, 8, 1, 10, 15, 0, 0, time.FixedZone("CST", 8*3600))
+
+	return []Message{
+		{
+			Label:       "revision 1 (active, yellow)",
+			Source:      src, ExternalID: ext, Revision: 1,
+			Severity: "yellow", Status: "active",
+			IssuedAt: base, EffectiveAt: base, ExpiresAt: base.Add(6 * time.Hour),
+			RegionCodes: regions,
+			Payload:     map[string]any{"headline": "暴雨黄色预警", "hazard": "rainstorm"},
+		},
+		{
+			Label:       "revision 2 (updated, orange)",
+			Source:      src, ExternalID: ext, Revision: 2,
+			Severity: "orange", Status: "updated",
+			IssuedAt: base.Add(1 * time.Hour), EffectiveAt: base.Add(1 * time.Hour), ExpiresAt: base.Add(8 * time.Hour),
+			RegionCodes: regions,
+			Payload:     map[string]any{"headline": "暴雨橙色预警", "hazard": "rainstorm"},
+		},
+		{
+			Label:       "revision 3 (cancelled / 解除)",
+			Source:      src, ExternalID: ext, Revision: 3,
+			Severity: "orange", Status: "cancelled",
+			IssuedAt: base.Add(2 * time.Hour), EffectiveAt: base.Add(2 * time.Hour), ExpiresAt: base.Add(8 * time.Hour),
+			RegionCodes: regions,
+			Payload:     map[string]any{"headline": "暴雨预警解除", "hazard": "rainstorm"},
+		},
+		{
+			Label:       "revision 4 (reactivated, red)",
+			Source:      src, ExternalID: ext, Revision: 4,
+			Severity: "red", Status: "active",
+			IssuedAt: r4Effective, EffectiveAt: r4Effective, ExpiresAt: r4Effective.Add(6 * time.Hour),
+			RegionCodes: regions,
+			Payload:     map[string]any{"headline": "暴雨红色预警", "hazard": "rainstorm", "note": "reactivated after lift"},
+		},
+	}
+}
