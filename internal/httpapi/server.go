@@ -29,6 +29,7 @@ func NewServer(st *store.Store) *Server {
 	s.mux.HandleFunc("GET /v1/warnings/{source}/{external_id}", s.getWarning)
 	s.mux.HandleFunc("GET /v1/warnings/{source}/{external_id}/events", s.listEvents)
 	s.mux.HandleFunc("GET /v1/warnings", s.searchWarnings)
+	s.mux.HandleFunc("GET /v1/outbox/dead", s.listDeadLetters)
 	return s
 }
 
@@ -213,6 +214,26 @@ func (s *Server) searchWarnings(w http.ResponseWriter, r *http.Request) {
 		resp.NextCursor = encodeCursor(last.Source, last.ExternalID)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// listDeadLetters 处理 GET /v1/outbox/dead?limit=：
+// 查询进入终止状态（连续失败达到上限）的通知，含失败次数与最后错误。
+func (s *Server) listDeadLetters(w http.ResponseWriter, r *http.Request) {
+	limit := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			writeError(w, http.StatusBadRequest, "bad_limit", "limit must be a positive integer")
+			return
+		}
+		limit = n
+	}
+	dead, err := s.store.DeadLetters(r.Context(), limit)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"dead_letters": dead})
 }
 
 // cursor 为 base64url("source\x1fexternal_id")，不透明的翻页令牌。

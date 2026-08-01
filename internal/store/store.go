@@ -60,16 +60,23 @@ type OutboxMessage struct {
 	NextAttemptAt  *time.Time      `json:"next_attempt_at,omitempty"`
 	LastError      *string         `json:"last_error,omitempty"`
 	DispatchedAt   *time.Time      `json:"dispatched_at,omitempty"`
+	ClaimedBy      *string         `json:"claimed_by,omitempty"`
+	ClaimedUntil   *time.Time      `json:"claimed_until,omitempty"`
+	// ClaimToken 是租约围栏令牌，仅供完成/失败时校验，不对外暴露。
+	ClaimToken     *string    `json:"-"`
+	DeadLetteredAt *time.Time `json:"dead_lettered_at,omitempty"`
 }
 
 const outboxColumns = `id, event_id, source, external_id, revision, kind, payload,
-	created_at, attempts, next_attempt_at, last_error, dispatched_at`
+	created_at, attempts, next_attempt_at, last_error, dispatched_at,
+	claimed_by, claimed_until, claim_token, dead_lettered_at`
 
 func scanOutbox(row pgx.Row) (OutboxMessage, error) {
 	var m OutboxMessage
 	err := row.Scan(
 		&m.ID, &m.EventID, &m.Source, &m.ExternalID, &m.Revision, &m.Kind, &m.Payload,
 		&m.CreatedAt, &m.Attempts, &m.NextAttemptAt, &m.LastError, &m.DispatchedAt,
+		&m.ClaimedBy, &m.ClaimedUntil, &m.ClaimToken, &m.DeadLetteredAt,
 	)
 	if err != nil {
 		return m, err
@@ -442,73 +449,125 @@ func (s *Store) Counts(ctx context.Context) (events, current, outbox int, err er
 	return
 }
 
-// OutboxClaim 是一批在当前事务内被行锁锁定的待投递通知。
-// 投递与标记在同一事务中完成：标记成功与锁定同时提交；
-// 若进程在投递后、提交前崩溃，事务回滚，行回到待投递状态等待重放。
-type OutboxClaim struct {
-	tx   pgx.Tx
-	Rows []OutboxMessage
-}
+// ErrLeaseLost 表示完成/失败标记时租约已不属于当前 worker
+// （租约过期后被其他 worker 接管，claim_token 已易主）。
+var ErrLeaseLost = errors.New("outbox lease lost")
 
-// MarkDispatched 在认领事务内把一行标记为已投递。
-func (c *OutboxClaim) MarkDispatched(ctx context.Context, id int64, at time.Time) error {
-	_, err := c.tx.Exec(ctx,
-		"UPDATE warning_outbox SET dispatched_at = $2 WHERE id = $1", id, at)
-	return err
-}
+// IsLeaseLost 判断错误是否为租约丢失。
+func IsLeaseLost(err error) bool { return errors.Is(err, ErrLeaseLost) }
 
-// MarkFailed 在认领事务内记录一次失败并安排下次重试时间。
-func (c *OutboxClaim) MarkFailed(ctx context.Context, id int64, cause error, nextAttemptAt time.Time) error {
-	_, err := c.tx.Exec(ctx,
-		`UPDATE warning_outbox
-		 SET attempts = attempts + 1, next_attempt_at = $2, last_error = $3
-		 WHERE id = $1`, id, nextAttemptAt, cause.Error())
-	return err
-}
-
-// WithOutboxClaim 在单个事务中以 FOR UPDATE SKIP LOCKED 认领至多 limit 行
-// 到期未投递的通知（按 id 稳定顺序），交给 fn 处理：
-//   - 并发 worker 不会认领同一行（SKIP LOCKED）；
-//   - fn 返回错误 → 事务整体回滚，所有标记作废、锁定释放，等待重放；
-//   - fn 返回 nil → 认领、投递标记一次性提交。
+// ClaimOutbox 在短事务内为 worker 认领至多 limit 行到期通知并授予租约：
+// 每行写入 claimed_by / claimed_until（= 现在 + lease）/ claim_token 后立即提交，
+// 投递在事务外进行，不长时间持有行锁。
 //
-// 返回本次认领的行数。
-func (s *Store) WithOutboxClaim(ctx context.Context, limit int, fn func(ctx context.Context, c *OutboxClaim) error) (int, error) {
-	tx, err := s.db.Begin(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("begin claim tx: %w", err)
+// 可认领条件：未投递、未死信、到达重试时间、且（无租约或租约已过期）。
+// 子查询 FOR UPDATE SKIP LOCKED 保证并发 worker 不会认领同一行；
+// 若认领者崩溃或卡住，租约过期后其他 worker 可接管（此时 token 易主，
+// 旧认领者的 Complete/Fail 将被 ErrLeaseLost 拒绝）。
+func (s *Store) ClaimOutbox(ctx context.Context, worker string, lease time.Duration, limit int) ([]OutboxMessage, error) {
+	if limit <= 0 {
+		limit = 32
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	rows, err := tx.Query(ctx,
-		`SELECT `+outboxColumns+` FROM warning_outbox
-		 WHERE dispatched_at IS NULL
-		   AND (next_attempt_at IS NULL OR next_attempt_at <= now())
-		 ORDER BY id ASC
-		 FOR UPDATE SKIP LOCKED
-		 LIMIT $1`, limit)
+	claimedUntil := s.now().Add(lease)
+	rows, err := s.db.Query(ctx,
+		`UPDATE warning_outbox AS o
+		 SET claimed_by = $1, claimed_until = $2, claim_token = sub.token
+		 FROM (
+			SELECT id, md5(random()::text || clock_timestamp()::text || id::text) AS token
+			FROM warning_outbox
+			WHERE dispatched_at IS NULL
+			  AND dead_lettered_at IS NULL
+			  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+			  AND (claimed_until IS NULL OR claimed_until < now())
+			ORDER BY id ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT $3
+		 ) AS sub
+		 WHERE o.id = sub.id
+		 RETURNING o.`+outboxColumns,
+		worker, claimedUntil, limit)
 	if err != nil {
-		return 0, fmt.Errorf("claim outbox: %w", err)
+		return nil, fmt.Errorf("claim outbox: %w", err)
 	}
 	defer rows.Close()
 
-	claim := &OutboxClaim{tx: tx}
+	var out []OutboxMessage
 	for rows.Next() {
 		m, err := scanOutbox(rows)
 		if err != nil {
-			return 0, fmt.Errorf("scan outbox: %w", err)
+			return nil, fmt.Errorf("scan claimed outbox: %w", err)
 		}
-		claim.Rows = append(claim.Rows, m)
+		out = append(out, m)
 	}
-	if err := rows.Err(); err != nil {
-		return 0, err
-	}
+	return out, rows.Err()
+}
 
-	if err := fn(ctx, claim); err != nil {
-		return 0, err
+// CompleteOutbox 把一行标记为已投递。只有持有当前 claim_token 的
+// worker 才能成功；租约被接管后调用返回 ErrLeaseLost。
+func (s *Store) CompleteOutbox(ctx context.Context, id int64, token string) error {
+	tag, err := s.db.Exec(ctx,
+		`UPDATE warning_outbox
+		 SET dispatched_at = $3, claimed_by = NULL, claimed_until = NULL, claim_token = NULL
+		 WHERE id = $1 AND claim_token = $2 AND dispatched_at IS NULL`,
+		id, token, s.now())
+	if err != nil {
+		return fmt.Errorf("complete outbox: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("commit claim: %w", err)
+	if tag.RowsAffected() != 1 {
+		return ErrLeaseLost
 	}
-	return len(claim.Rows), nil
+	return nil
+}
+
+// FailOutbox 记录一次投递失败并安排退避；当累计失败达到 maxAttempts 时
+// 写入 dead_lettered_at，进入终止状态（不再被认领，可经 DeadLetters 查询）。
+// 返回最新 attempts 与是否已进入死信。token 校验同 CompleteOutbox。
+func (s *Store) FailOutbox(ctx context.Context, id int64, token string, cause error, backoff time.Duration, maxAttempts int) (attempts int, dead bool, err error) {
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
+	err = s.db.QueryRow(ctx,
+		`UPDATE warning_outbox
+		 SET attempts = attempts + 1,
+		     last_error = $3,
+		     claimed_by = NULL, claimed_until = NULL, claim_token = NULL,
+		     next_attempt_at = CASE WHEN attempts + 1 >= $5 THEN NULL ELSE $4::timestamptz END,
+		     dead_lettered_at = CASE WHEN attempts + 1 >= $5 THEN $6::timestamptz ELSE NULL END
+		 WHERE id = $1 AND claim_token = $2 AND dispatched_at IS NULL
+		 RETURNING attempts, dead_lettered_at IS NOT NULL`,
+		id, token, cause.Error(), s.now().Add(backoff), maxAttempts, s.now()).
+		Scan(&attempts, &dead)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, ErrLeaseLost
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("fail outbox: %w", err)
+	}
+	return attempts, dead, nil
+}
+
+// DeadLetters 返回进入终止状态（死信）的通知，按 id 稳定升序。
+func (s *Store) DeadLetters(ctx context.Context, limit int) ([]OutboxMessage, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.db.Query(ctx,
+		`SELECT `+outboxColumns+` FROM warning_outbox
+		 WHERE dead_lettered_at IS NOT NULL
+		 ORDER BY id ASC
+		 LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list dead letters: %w", err)
+	}
+	defer rows.Close()
+
+	out := []OutboxMessage{}
+	for rows.Next() {
+		m, err := scanOutbox(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan dead letter: %w", err)
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }

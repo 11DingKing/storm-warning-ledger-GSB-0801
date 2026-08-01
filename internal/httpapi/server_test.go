@@ -7,27 +7,20 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 	"time"
 
 	"storm-warning-ledger/internal/domain"
 	"storm-warning-ledger/internal/store"
+	"storm-warning-ledger/internal/testutil"
 )
 
-// newTestServer 建真实 DB + httptest.Server；未配置 TEST_DATABASE_URL 时跳过。
-func newTestServer(t *testing.T) *httptest.Server {
+// newTestServer 建独立 schema 的真实 DB + httptest.Server；
+// 未配置 TEST_DATABASE_URL 时跳过。
+func newTestServer(t *testing.T) (*httptest.Server, *store.Store) {
 	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
-	}
+	pool := testutil.IsolatedPool(t)
 	ctx := context.Background()
-	pool, err := store.NewPool(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(pool.Close)
 	if err := store.Migrate(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -35,9 +28,10 @@ func newTestServer(t *testing.T) *httptest.Server {
 		"TRUNCATE warning_events, warning_current, warning_outbox RESTART IDENTITY"); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
-	srv := httptest.NewServer(NewServer(store.New(pool)).Handler())
+	st := store.New(pool)
+	srv := httptest.NewServer(NewServer(st).Handler())
 	t.Cleanup(srv.Close)
-	return srv
+	return srv, st
 }
 
 func postEvent(t *testing.T, baseURL string, body string) (int, store.AppendResult) {
@@ -83,7 +77,7 @@ func getJSON[T any](t *testing.T, url string, wantStatus int) T {
 }
 
 func TestHTTPLifecycle(t *testing.T) {
-	srv := newTestServer(t)
+	srv, _ := newTestServer(t)
 	src, ext := "cn-met", "http-1"
 	url := fmt.Sprintf("%s/v1/warnings/%s/%s", srv.URL, src, ext)
 
@@ -179,5 +173,48 @@ func TestHTTPLifecycle(t *testing.T) {
 	_ = json.NewDecoder(resp.Body).Decode(&ve)
 	if len(ve.Fields) == 0 {
 		t.Fatal("expected field-level errors")
+	}
+}
+
+// TestDeadLettersEndpoint 通过存储层把一条通知打成死信，
+// 验证 GET /v1/outbox/dead 暴露终止状态（attempts/last_error/dead_lettered_at）。
+func TestDeadLettersEndpoint(t *testing.T) {
+	srv, st := newTestServer(t)
+	ctx := context.Background()
+
+	code, res := postEvent(t, srv.URL, eventJSON("cn-met", "delivery-poison-01", 1, "red", "active", "420000"))
+	if code != http.StatusCreated || res.Outbox == nil {
+		t.Fatalf("seed: code=%d outbox=%+v", code, res.Outbox)
+	}
+
+	// 连续失败三次 → 死信
+	for i := 0; i < 3; i++ {
+		claimed, err := st.ClaimOutbox(ctx, "worker-test", time.Minute, 1)
+		if err != nil || len(claimed) != 1 {
+			t.Fatalf("round %d claim: n=%d err=%v", i, len(claimed), err)
+		}
+		token := *claimed[0].ClaimToken
+		if _, _, err := st.FailOutbox(ctx, claimed[0].ID, token,
+			fmt.Errorf("downstream returned 500"), 0, 3); err != nil {
+			t.Fatalf("round %d fail: %v", i, err)
+		}
+	}
+
+	body := getJSON[struct {
+		DeadLetters []store.OutboxMessage `json:"dead_letters"`
+	}](t, srv.URL+"/v1/outbox/dead", http.StatusOK)
+	if len(body.DeadLetters) != 1 {
+		t.Fatalf("dead_letters=%d, want 1", len(body.DeadLetters))
+	}
+	dl := body.DeadLetters[0]
+	if dl.NotificationID != "cn-met/delivery-poison-01/1" || dl.Attempts != 3 ||
+		dl.DeadLetteredAt == nil || dl.LastError == nil {
+		t.Fatalf("dead letter: %+v", dl)
+	}
+
+	// 死信后不再被认领
+	claimed, err := st.ClaimOutbox(ctx, "worker-test", time.Minute, 10)
+	if err != nil || len(claimed) != 0 {
+		t.Fatalf("dead letter claimed again: n=%d err=%v", len(claimed), err)
 	}
 }

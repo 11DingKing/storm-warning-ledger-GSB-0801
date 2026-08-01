@@ -108,6 +108,29 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/WarningEvent"
+  /v1/outbox/dead:
+    get:
+      tags: [warnings]
+      summary: 查询死信（连续失败达到上限、进入终止状态的通知）
+      description: 死信不再被 dispatcher 认领；响应包含失败次数、最后错误与进入死信的时间。
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        "200":
+          description: 死信列表，按 id 稳定升序
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dead_letters:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/OutboxMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
   /v1/warnings:
     get:
       tags: [warnings]
@@ -259,6 +282,9 @@ components:
         next_attempt_at: { type: string, format: date-time }
         last_error: { type: string }
         dispatched_at: { type: string, format: date-time }
+        claimed_by: { type: string, description: 当前租约持有者 }
+        claimed_until: { type: string, format: date-time, description: 租约过期时刻；过期后可被其他 worker 接管 }
+        dead_lettered_at: { type: string, format: date-time, description: 非空即终止状态（死信），不再被认领 }
     Error:
       type: object
       properties:

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,21 +11,14 @@ import (
 	"time"
 
 	"storm-warning-ledger/internal/domain"
+	"storm-warning-ledger/internal/testutil"
 )
 
-// testDB 返回截断过三张表的 Store；未配置 TEST_DATABASE_URL 时跳过。
+// testDB 返回独立 schema 中的 Store；未配置 TEST_DATABASE_URL 时跳过。
 func testDB(t *testing.T) *Store {
 	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
-	}
+	pool := testutil.IsolatedPool(t)
 	ctx := context.Background()
-	pool, err := NewPool(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(pool.Close)
 	if err := Migrate(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

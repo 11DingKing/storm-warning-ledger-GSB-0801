@@ -1,19 +1,24 @@
 // Package dispatch 实现事务性 outbox 的投递循环：
-// 认领（FOR UPDATE SKIP LOCKED）→ 投递 → 标记，全部在同一事务提交。
+// 短事务授予租约（FOR UPDATE SKIP LOCKED）→ 事务外投递 → token 围栏标记。
 //
 // 语义保证：
-//   - 多个 worker 并发时，一行通知同一时刻只会被一个 worker 认领；
-//   - 投递成功后、标记提交前进程崩溃 → 事务回滚，通知回到待投递，
-//     重启后按同一 NotificationID 重投，下游凭身份幂等去重；
-//   - 投递失败按指数退避重试，身份始终不变。
+//   - 多个 worker 并发时，一行通知同一时刻只属一个租约持有者；
+//   - 持有者崩溃或卡住 → 租约（claimed_until）过期后由其他 worker 接管，
+//     接管会轮换 claim_token，旧持有者的标记被 ErrLeaseLost 拒绝（围栏）；
+//   - 无论重投多少次，通知身份 NotificationID 不变，下游凭身份幂等，
+//     一条修订最终只产生一个业务通知；
+//   - 连续失败达到 MaxAttempts（默认 3）进入死信（dead_lettered_at），
+//     不再被认领，可经 GET /v1/outbox/dead 查询。
 package dispatch
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"storm-warning-ledger/internal/store"
@@ -65,6 +70,12 @@ func (LogDeliverer) Deliver(_ context.Context, msg store.OutboxMessage) error {
 // Options 调整 Dispatcher 行为。
 type Options struct {
 	BatchSize int
+	// WorkerID 租约持有者标识；为空时自动生成（hostname/pid）。
+	WorkerID string
+	// LeaseDuration 租约时长：认领后在该时限内独占该行；崩溃/卡住超时即被接管。
+	LeaseDuration time.Duration
+	// MaxAttempts 连续失败达到该次数后进入死信（默认 3）。
+	MaxAttempts int
 	// Backoff 依据已失败次数返回下次重试间隔；nil 用默认指数退避。
 	Backoff func(attempts int) time.Duration
 	// FailPoint 仅用于测试：在指定阶段注入错误，验证崩溃恢复。
@@ -85,6 +96,16 @@ func New(st *store.Store, d Deliverer, opts Options) *Dispatcher {
 	if opts.BatchSize <= 0 {
 		opts.BatchSize = 32
 	}
+	if opts.WorkerID == "" {
+		host, _ := os.Hostname()
+		opts.WorkerID = fmt.Sprintf("%s/%d", host, os.Getpid())
+	}
+	if opts.LeaseDuration <= 0 {
+		opts.LeaseDuration = 30 * time.Second
+	}
+	if opts.MaxAttempts <= 0 {
+		opts.MaxAttempts = 3
+	}
 	if opts.Backoff == nil {
 		opts.Backoff = DefaultBackoff
 	}
@@ -101,30 +122,49 @@ func DefaultBackoff(attempts int) time.Duration {
 	return time.Second << min(attempts, 6)
 }
 
-// DispatchOnce 处理一批到期通知，返回认领行数。
-// 每行：投递成功 → （可选注入崩溃点）→ 标记已投递；投递失败 → 记录退避。
-// 崩溃点或标记失败会让整批事务回滚——已投递的行将以同一身份重投。
+// DispatchOnce 认领一批到期通知并逐行投递，返回认领行数。
+// 每行：投递成功 →（可选注入崩溃点）→ CompleteOutbox；
+// 投递失败 → FailOutbox（退避或死信）。
+// 租约被接管时标记返回 ErrLeaseLost：本行已由新持有者负责，直接跳过。
 func (d *Dispatcher) DispatchOnce(ctx context.Context) (int, error) {
-	return d.store.WithOutboxClaim(ctx, d.opts.BatchSize, func(ctx context.Context, c *store.OutboxClaim) error {
-		for _, msg := range c.Rows {
-			if err := d.deliver.Deliver(ctx, msg); err != nil {
-				next := d.now().Add(d.opts.Backoff(msg.Attempts))
-				if merr := c.MarkFailed(ctx, msg.ID, err, next); merr != nil {
-					return fmt.Errorf("mark failed: %w", merr)
-				}
-				continue
+	claimed, err := d.store.ClaimOutbox(ctx, d.opts.WorkerID, d.opts.LeaseDuration, d.opts.BatchSize)
+	if err != nil {
+		return 0, err
+	}
+	for _, msg := range claimed {
+		token := ""
+		if msg.ClaimToken != nil {
+			token = *msg.ClaimToken
+		}
+		if err := d.deliver.Deliver(ctx, msg); err != nil {
+			attempts, dead, ferr := d.store.FailOutbox(ctx, msg.ID, token, err,
+				d.opts.Backoff(msg.Attempts), d.opts.MaxAttempts)
+			switch {
+			case errors.Is(ferr, store.ErrLeaseLost):
+				log.Printf("worker %s lost lease for %s (taken over)", d.opts.WorkerID, msg.NotificationID)
+			case ferr != nil:
+				return 0, fmt.Errorf("mark failed: %w", ferr)
+			case dead:
+				log.Printf("worker %s dead-lettered %s after %d attempts: %v",
+					d.opts.WorkerID, msg.NotificationID, attempts, err)
 			}
-			if d.opts.FailPoint != nil {
-				if err := d.opts.FailPoint("afterDeliverBeforeMark", msg); err != nil {
-					return err // 模拟崩溃：整批回滚，本行已投递但未标记
-				}
-			}
-			if err := c.MarkDispatched(ctx, msg.ID, d.now()); err != nil {
-				return fmt.Errorf("mark dispatched: %w", err)
+			continue
+		}
+		if d.opts.FailPoint != nil {
+			if err := d.opts.FailPoint("afterDeliverBeforeMark", msg); err != nil {
+				// 模拟崩溃：行保持本 worker 租约，未标记；租约过期后被接管
+				return 0, err
 			}
 		}
-		return nil
-	})
+		if err := d.store.CompleteOutbox(ctx, msg.ID, token); err != nil {
+			if errors.Is(err, store.ErrLeaseLost) {
+				log.Printf("worker %s lost lease for %s (taken over)", d.opts.WorkerID, msg.NotificationID)
+				continue
+			}
+			return 0, fmt.Errorf("mark dispatched: %w", err)
+		}
+	}
+	return len(claimed), nil
 }
 
 // Run 以固定间隔轮询，直到 ctx 取消。
