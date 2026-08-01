@@ -1,0 +1,297 @@
+openapi: 3.0.3
+info:
+  title: Storm Warning Ledger API
+  version: 1.0.0
+  description: |
+    Append-only event stream for multi-province storm warnings (rainstorm,
+    thunderstorm wind, hail). The service deduplicates repeated messages,
+    ignores stale lower revisions, records cancellations as new events, and
+    supports as-of temporal queries. Event persistence and outbox notification
+    enqueue are atomic.
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+
+paths:
+  /api/v1/warnings:
+    post:
+      summary: Ingest a warning revision or cancellation
+      description: |
+        Appends a warning event. The combination (source, external_id,
+        revision) is idempotent: repeated POSTs of the same revision return
+        the original event with deduplicated=true and do not create new rows.
+        A lower revision arriving late is stored (if new) but never rolls back
+        the current projected state.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestRequest'
+      responses:
+        '201':
+          description: Event created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResponse'
+        '200':
+          description: Idempotent duplicate
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+    get:
+      summary: Search warnings by current state
+      parameters:
+        - name: area_code
+          in: query
+          schema: { type: string }
+        - name: warning_type
+          in: query
+          schema: { type: string, enum: [rainstorm, thunderstorm_wind, hail] }
+        - name: severity
+          in: query
+          schema: { type: string, enum: [blue, yellow, orange, red] }
+        - name: status
+          in: query
+          schema: { type: string, enum: [active, cancelled] }
+        - name: active_only
+          in: query
+          schema: { type: boolean }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+      responses:
+        '200':
+          description: Page of current warning states
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResponse'
+
+  /api/v1/warnings/{source}/{external_id}:
+    get:
+      summary: Get current effective state of a warning
+      parameters:
+        - $ref: '#/components/parameters/Source'
+        - $ref: '#/components/parameters/ExternalID'
+      responses:
+        '200':
+          description: Current state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StateResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/warnings/{source}/{external_id}/history:
+    get:
+      summary: Get the append-only event stream
+      description: |
+        Returns every recorded event for the warning in insertion order, with a
+        `superseded` flag indicating whether a higher revision exists. Late and
+        duplicate traces are visible here.
+      parameters:
+        - $ref: '#/components/parameters/Source'
+        - $ref: '#/components/parameters/ExternalID'
+      responses:
+        '200':
+          description: Event history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HistoryResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/warnings/{source}/{external_id}/as-of:
+    get:
+      summary: Get state as it was known at a past time
+      description: |
+        Returns the highest-revision event received at or before `at`. This
+        answers "what did the system believe at time T?" even after late or
+        duplicate messages have since arrived.
+      parameters:
+        - $ref: '#/components/parameters/Source'
+        - $ref: '#/components/parameters/ExternalID'
+        - name: at
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: State as of the given time
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StateResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /healthz:
+    get:
+      summary: Liveness probe
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+components:
+  parameters:
+    Source:
+      name: source
+      in: path
+      required: true
+      schema: { type: string }
+    ExternalID:
+      name: external_id
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  schemas:
+    IngestRequest:
+      type: object
+      required:
+        - source
+        - external_id
+        - revision
+        - warning_type
+        - severity
+        - area_code
+        - issued_at
+        - effective_at
+        - expires_at
+        - status
+      properties:
+        source: { type: string, example: CMA }
+        external_id: { type: string, example: BJ-2026-RAIN-001 }
+        revision: { type: integer, minimum: 1, example: 1 }
+        warning_type:
+          type: string
+          enum: [rainstorm, thunderstorm_wind, hail]
+        severity:
+          type: string
+          enum: [blue, yellow, orange, red]
+        area_code: { type: string, example: "110000" }
+        area_name: { type: string, example: Beijing }
+        issued_at: { type: string, format: date-time }
+        effective_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        status:
+          type: string
+          enum: [active, cancelled]
+          description: |
+            active for a new/updated revision, cancelled for a termination.
+            Common variants (cancel, cleared, expired, 解除) are normalized.
+        payload:
+          type: object
+          additionalProperties: true
+          description: Raw upstream message, stored verbatim for traceability.
+        received_at:
+          type: string
+          format: date-time
+          description: Optional override of the receive time (for replay); defaults to now.
+
+    EventResponse:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        source: { type: string }
+        external_id: { type: string }
+        revision: { type: integer }
+        event_type: { type: string, enum: [revision, cancellation] }
+        warning_type: { type: string }
+        severity: { type: string }
+        area_code: { type: string }
+        area_name: { type: string }
+        issued_at: { type: string, format: date-time }
+        effective_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        status: { type: string }
+        payload: { type: object, additionalProperties: true }
+        received_at: { type: string, format: date-time }
+        recorded_at: { type: string, format: date-time }
+
+    IngestResponse:
+      type: object
+      properties:
+        created: { type: boolean }
+        deduplicated: { type: boolean }
+        event: { $ref: '#/components/schemas/EventResponse' }
+
+    StateResponse:
+      type: object
+      properties:
+        source: { type: string }
+        external_id: { type: string }
+        revision: { type: integer }
+        event_type: { type: string }
+        status: { type: string }
+        active: { type: boolean }
+        warning_type: { type: string }
+        severity: { type: string }
+        area_code: { type: string }
+        area_name: { type: string }
+        issued_at: { type: string, format: date-time }
+        effective_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        payload: { type: object, additionalProperties: true }
+        last_event_id: { type: integer, format: int64 }
+        last_received_at: { type: string, format: date-time }
+        last_recorded_at: { type: string, format: date-time }
+        event_count:
+          type: integer
+          description: Total events for the aggregate (including superseded traces).
+
+    HistoryResponse:
+      type: object
+      properties:
+        source: { type: string }
+        external_id: { type: string }
+        count: { type: integer }
+        events:
+          type: array
+          items:
+            allOf:
+              - $ref: '#/components/schemas/EventResponse'
+              - type: object
+                properties:
+                  superseded: { type: boolean }
+
+    SearchResponse:
+      type: object
+      properties:
+        total: { type: integer }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/StateResponse' }
+
+    ErrorResponse:
+      type: object
+      properties:
+        error: { type: string }
