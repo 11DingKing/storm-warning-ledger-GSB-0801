@@ -34,11 +34,48 @@ const (
 	OutcomeReplayed Outcome = "replayed"
 )
 
-// AppendResult 是写入请求的结果：事件本体、处置结果与处置后的当前状态。
+// AppendResult 是写入请求的结果：事件本体、处置结果、处置后的当前状态，
+// 以及该事件对应的 outbox 通知（迟到事件无通知，为 nil）。
+// 幂等重放时返回的是首次写入的事件与通知，不会产生新行。
 type AppendResult struct {
-	Event   domain.Event `json:"event"`
-	Outcome Outcome      `json:"outcome"`
-	Current domain.State `json:"current"`
+	Event   domain.Event   `json:"event"`
+	Outcome Outcome        `json:"outcome"`
+	Current domain.State   `json:"current"`
+	Outbox  *OutboxMessage `json:"outbox,omitempty"`
+}
+
+// OutboxMessage 是 warning_outbox 中的一行：一条待投递/已投递的状态变更通知。
+// NotificationID 由 (source, external_id, revision) 派生，重投时稳定不变。
+type OutboxMessage struct {
+	ID             int64           `json:"id"`
+	NotificationID string          `json:"notification_id"`
+	EventID        int64           `json:"event_id"`
+	Source         string          `json:"source"`
+	ExternalID     string          `json:"external_id"`
+	Revision       int             `json:"revision"`
+	Kind           string          `json:"kind"`
+	Payload        json.RawMessage `json:"payload"`
+	CreatedAt      time.Time       `json:"created_at"`
+	Attempts       int             `json:"attempts"`
+	NextAttemptAt  *time.Time      `json:"next_attempt_at,omitempty"`
+	LastError      *string         `json:"last_error,omitempty"`
+	DispatchedAt   *time.Time      `json:"dispatched_at,omitempty"`
+}
+
+const outboxColumns = `id, event_id, source, external_id, revision, kind, payload,
+	created_at, attempts, next_attempt_at, last_error, dispatched_at`
+
+func scanOutbox(row pgx.Row) (OutboxMessage, error) {
+	var m OutboxMessage
+	err := row.Scan(
+		&m.ID, &m.EventID, &m.Source, &m.ExternalID, &m.Revision, &m.Kind, &m.Payload,
+		&m.CreatedAt, &m.Attempts, &m.NextAttemptAt, &m.LastError, &m.DispatchedAt,
+	)
+	if err != nil {
+		return m, err
+	}
+	m.NotificationID = domain.NotificationID(m.Source, m.ExternalID, m.Revision)
+	return m, nil
 }
 
 // Store 封装全部数据库访问。now 可注入以便测试确定性时间。
@@ -54,6 +91,9 @@ type Store struct {
 func New(db DBTX) *Store {
 	return &Store{db: db, now: func() time.Time { return time.Now().UTC() }}
 }
+
+// DB 返回底层连接（测试与运维核对用）。
+func (s *Store) DB() DBTX { return s.db }
 
 // NewPool 以连接串创建连接池（供 main 使用）。
 func NewPool(ctx context.Context, url string) (*pgxpool.Pool, error) {
@@ -195,22 +235,31 @@ func (s *Store) Append(ctx context.Context, raw domain.Input) (AppendResult, err
 			}
 		}
 
-		// outbox 与事件同事务写入：通知与状态变更原子可见
+		// outbox 与事件同事务写入：通知与状态变更原子可见。
+		// notification_id 由三元组派生，重放/重投身份不变。
 		payload, err := json.Marshal(struct {
-			Type  string       `json:"type"`
-			Event domain.Event `json:"event"`
-		}{Type: "warning." + string(event.Status), Event: event})
+			NotificationID string       `json:"notification_id"`
+			Type           string       `json:"type"`
+			Event          domain.Event `json:"event"`
+		}{
+			NotificationID: domain.NotificationID(event.Source, event.ExternalID, event.Revision),
+			Type:           "warning." + string(event.Status),
+			Event:          event,
+		})
 		if err != nil {
 			return AppendResult{}, fmt.Errorf("marshal outbox payload: %w", err)
 		}
-		if _, err := tx.Exec(ctx,
+		msg, err := scanOutbox(tx.QueryRow(ctx,
 			`INSERT INTO warning_outbox (event_id, source, external_id, revision, kind, payload, created_at)
-			 VALUES ($1,$2,$3,$4,'applied',$5,$6)`,
-			event.ID, event.Source, event.ExternalID, event.Revision, payload, receivedAt); err != nil {
+			 VALUES ($1,$2,$3,$4,'applied',$5,$6)
+			 RETURNING `+outboxColumns,
+			event.ID, event.Source, event.ExternalID, event.Revision, payload, receivedAt))
+		if err != nil {
 			return AppendResult{}, fmt.Errorf("insert outbox: %w", err)
 		}
 		res.Outcome = OutcomeApplied
 		res.Current = st
+		res.Outbox = &msg
 	} else {
 		// 迟到事件：只留痕。当前状态保持不变，不产生通知。
 		res.Outcome = OutcomeLate
@@ -241,7 +290,16 @@ func (s *Store) replayOrConflict(ctx context.Context, in domain.Input, fp string
 	if err != nil {
 		return AppendResult{}, err
 	}
-	return AppendResult{Event: existing, Outcome: OutcomeReplayed, Current: current}, nil
+	// 重放必须返回首次写入的事件与通知；该事件当初若是迟到留痕则无通知（nil）
+	var msg *OutboxMessage
+	if m, err := scanOutbox(s.db.QueryRow(ctx,
+		"SELECT "+outboxColumns+" FROM warning_outbox WHERE source = $1 AND external_id = $2 AND revision = $3",
+		in.Source, in.ExternalID, in.Revision)); err == nil {
+		msg = &m
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return AppendResult{}, fmt.Errorf("load outbox for replay: %w", err)
+	}
+	return AppendResult{Event: existing, Outcome: OutcomeReplayed, Current: current, Outbox: msg}, nil
 }
 
 // Current 返回事件序列的当前有效状态。
@@ -382,4 +440,75 @@ func (s *Store) Counts(ctx context.Context) (events, current, outbox int, err er
 	}
 	err = s.db.QueryRow(ctx, "SELECT count(*) FROM warning_outbox").Scan(&outbox)
 	return
+}
+
+// OutboxClaim 是一批在当前事务内被行锁锁定的待投递通知。
+// 投递与标记在同一事务中完成：标记成功与锁定同时提交；
+// 若进程在投递后、提交前崩溃，事务回滚，行回到待投递状态等待重放。
+type OutboxClaim struct {
+	tx   pgx.Tx
+	Rows []OutboxMessage
+}
+
+// MarkDispatched 在认领事务内把一行标记为已投递。
+func (c *OutboxClaim) MarkDispatched(ctx context.Context, id int64, at time.Time) error {
+	_, err := c.tx.Exec(ctx,
+		"UPDATE warning_outbox SET dispatched_at = $2 WHERE id = $1", id, at)
+	return err
+}
+
+// MarkFailed 在认领事务内记录一次失败并安排下次重试时间。
+func (c *OutboxClaim) MarkFailed(ctx context.Context, id int64, cause error, nextAttemptAt time.Time) error {
+	_, err := c.tx.Exec(ctx,
+		`UPDATE warning_outbox
+		 SET attempts = attempts + 1, next_attempt_at = $2, last_error = $3
+		 WHERE id = $1`, id, nextAttemptAt, cause.Error())
+	return err
+}
+
+// WithOutboxClaim 在单个事务中以 FOR UPDATE SKIP LOCKED 认领至多 limit 行
+// 到期未投递的通知（按 id 稳定顺序），交给 fn 处理：
+//   - 并发 worker 不会认领同一行（SKIP LOCKED）；
+//   - fn 返回错误 → 事务整体回滚，所有标记作废、锁定释放，等待重放；
+//   - fn 返回 nil → 认领、投递标记一次性提交。
+//
+// 返回本次认领的行数。
+func (s *Store) WithOutboxClaim(ctx context.Context, limit int, fn func(ctx context.Context, c *OutboxClaim) error) (int, error) {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin claim tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	rows, err := tx.Query(ctx,
+		`SELECT `+outboxColumns+` FROM warning_outbox
+		 WHERE dispatched_at IS NULL
+		   AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+		 ORDER BY id ASC
+		 FOR UPDATE SKIP LOCKED
+		 LIMIT $1`, limit)
+	if err != nil {
+		return 0, fmt.Errorf("claim outbox: %w", err)
+	}
+	defer rows.Close()
+
+	claim := &OutboxClaim{tx: tx}
+	for rows.Next() {
+		m, err := scanOutbox(rows)
+		if err != nil {
+			return 0, fmt.Errorf("scan outbox: %w", err)
+		}
+		claim.Rows = append(claim.Rows, m)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	if err := fn(ctx, claim); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit claim: %w", err)
+	}
+	return len(claim.Rows), nil
 }

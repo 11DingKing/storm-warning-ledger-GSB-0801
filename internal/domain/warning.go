@@ -249,6 +249,12 @@ func AsOf(events []Event, t time.Time) (State, bool) {
 	return StateOf(*best), true
 }
 
+// NotificationID 返回一条通知的稳定身份：source/external_id/revision。
+// 同一逻辑通知无论重投多少次身份不变，下游可据此幂等去重。
+func NotificationID(source, externalID string, revision int) string {
+	return fmt.Sprintf("%s/%s/%d", source, externalID, revision)
+}
+
 // ErrConflict 表示三元组已存在但内容不同（同号不同内容的冲突修订）。
 type ErrConflict struct {
 	Source     string

@@ -118,6 +118,94 @@ func TestAppendLifecycle(t *testing.T) {
 	}
 }
 
+// TestRev4AfterCancellation 覆盖“解除后恢复发布”：rev3 解除 → rev4 重新 active。
+// 要求：rev3 解除记录不被改写；重复提交 rev4 返回首次的事件与 outbox。
+func TestRev4AfterCancellation(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+	src, ext := "cn-met", "rev4-chain"
+
+	t1 := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	t3 := t1.Add(20 * time.Minute)
+	t4 := t1.Add(30 * time.Minute)
+
+	// rev1 生效（t1）
+	s.now = func() time.Time { return t1 }
+	if _, err := s.Append(ctx, mkInput(src, ext, 1)); err != nil {
+		t.Fatal(err)
+	}
+	// rev3 解除（t3）
+	s.now = func() time.Time { return t3 }
+	cancelIn := mkInput(src, ext, 3)
+	cancelIn.Status = domain.StatusCancelled
+	r3, err := s.Append(ctx, cancelIn)
+	if err != nil || r3.Current.Status != domain.StatusCancelled {
+		t.Fatalf("rev3 cancel: %+v err=%v", r3, err)
+	}
+
+	// rev4 恢复发布：active / red / effective_at 更新
+	s.now = func() time.Time { return t4 }
+	rev4 := mkInput(src, ext, 4)
+	rev4.Severity = domain.SeverityRed
+	rev4.EffectiveAt = time.Date(2026, 8, 1, 10, 15, 0, 0, time.FixedZone("CST", 8*3600))
+	a4, err := s.Append(ctx, rev4)
+	if err != nil || a4.Outcome != OutcomeApplied {
+		t.Fatalf("rev4: outcome=%s err=%v", a4.Outcome, err)
+	}
+	if a4.Current.Status != domain.StatusActive ||
+		a4.Current.Severity != domain.SeverityRed ||
+		!a4.Current.EffectiveAt.Equal(rev4.EffectiveAt) {
+		t.Fatalf("rev4 current: %+v", a4.Current)
+	}
+	if a4.Outbox == nil || a4.Outbox.NotificationID != "cn-met/rev4-chain/4" {
+		t.Fatalf("rev4 outbox: %+v", a4.Outbox)
+	}
+
+	// 重复提交 rev4：必须返回第一次的事件与 outbox
+	dup, err := s.Append(ctx, rev4)
+	if err != nil || dup.Outcome != OutcomeReplayed {
+		t.Fatalf("dup rev4: outcome=%s err=%v", dup.Outcome, err)
+	}
+	if dup.Event.ID != a4.Event.ID {
+		t.Fatalf("dup rev4 event id=%d, want %d", dup.Event.ID, a4.Event.ID)
+	}
+	if dup.Outbox == nil || dup.Outbox.ID != a4.Outbox.ID ||
+		dup.Outbox.NotificationID != a4.Outbox.NotificationID {
+		t.Fatalf("dup rev4 outbox=%+v, want first %+v", dup.Outbox, a4.Outbox)
+	}
+
+	// rev3 解除记录未被改写：事件行原样、as_of(t3) 仍为 cancelled
+	events, err := s.Events(ctx, src, ext)
+	if err != nil || len(events) != 3 {
+		t.Fatalf("events=%d err=%v", len(events), err)
+	}
+	var rev3Row *domain.Event
+	for i := range events {
+		if events[i].Revision == 3 {
+			rev3Row = &events[i]
+		}
+	}
+	if rev3Row == nil || rev3Row.Status != domain.StatusCancelled ||
+		!rev3Row.ReceivedAt.Equal(t3) || rev3Row.ID != r3.Event.ID {
+		t.Fatalf("rev3 audit row polluted: %+v", rev3Row)
+	}
+	st, err := s.CurrentAsOf(ctx, src, ext, t3)
+	if err != nil || st.Revision != 3 || st.Status != domain.StatusCancelled {
+		t.Fatalf("as_of(t3): %+v err=%v", st, err)
+	}
+	// as_of(t4) 之后为 rev4 active
+	st, err = s.CurrentAsOf(ctx, src, ext, t4.Add(time.Minute))
+	if err != nil || st.Revision != 4 || st.Status != domain.StatusActive {
+		t.Fatalf("as_of(t4+): %+v err=%v", st, err)
+	}
+
+	// outbox 不变量：rev1 生效、rev3 解除、rev4 恢复各一行
+	_, _, outbox, err := s.Counts(ctx)
+	if err != nil || outbox != 3 {
+		t.Fatalf("outbox=%d err=%v, want 3", outbox, err)
+	}
+}
+
 func TestConcurrentSameRevision(t *testing.T) {
 	s := testDB(t)
 	ctx := context.Background()

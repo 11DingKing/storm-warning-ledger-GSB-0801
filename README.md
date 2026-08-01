@@ -6,6 +6,7 @@
 - **幂等**：同一 `source + external_id + revision` 由唯一约束保证全库只落一行，重复提交返回 `replayed`，同号不同内容返回 `409`；
 - **修订号驱动状态**：更高修订（含 `cancelled` 解除）成为当前有效状态；更低修订的迟到消息只留痕（`late`），不回退当前状态；
 - **事务性 outbox**：事件、当前状态物化、通知在同一事务提交——要么全部可见，要么整体回滚；
+- **可投递、可重试的通知流水线**：独立 dispatcher worker 以 `FOR UPDATE SKIP LOCKED` 认领通知，多 worker 不会重复认领同一行；投递后、标记前崩溃则整批回滚，重启后按**同一通知身份** `source/external_id/revision` 重投，下游凭 `X-Notification-ID` 幂等；失败按指数退避重试；
 - **as_of 历史**：可按任意时刻重建当时的有效状态；
 - **稳定排序**：审计轨迹按自增 `id`（接收顺序）返回，检索按 `(source, external_id)` keyset 分页。
 
@@ -15,8 +16,10 @@
 
 ```
 cmd/server/            API 服务入口（启动时自动执行迁移）
+cmd/dispatcher/        outbox 投递 worker（可启动任意多个实例）
 internal/domain/       领域模型与纯决策逻辑（修订决策、指纹、as_of 折叠、校验）
-internal/store/        PostgreSQL 持久化（事务、唯一约束、outbox、检索）+ 内置 migrator
+internal/store/        PostgreSQL 持久化（事务、唯一约束、outbox 认领/标记）+ 内置 migrator
+internal/dispatch/     投递循环：SKIP LOCKED 认领 → 投递 → 标记，退避重试，崩溃钩子
 internal/httpapi/      HTTP JSON API（协议转换与错误映射）
 migrations/            SQL 迁移（embed 进二进制）
 openapi.yaml           OpenAPI 3.0 规范
@@ -42,11 +45,15 @@ TEST_DATABASE_URL="postgres://localhost:5433/storm_warning_test?sslmode=disable"
 # 4. 启动 API（默认 :8080）
 DATABASE_URL="postgres://localhost:5433/storm_warning?sslmode=disable" go run ./cmd/server
 
-# 5. 另开终端，回放种子数据（修订 1 / 修订 2 / 重复修订 1 / 冲突修订 1 / 修订 3 解除 + 乱序序列）
+# 5. 启动投递 worker（可同时启动多个；WEBHOOK_URL 为空则只打日志）
+WEBHOOK_URL="http://localhost:9090/" DATABASE_URL="postgres://localhost:5433/storm_warning?sslmode=disable" \
+  go run ./cmd/dispatcher
+
+# 6. 另开终端，回放种子数据（修订 1 / 修订 2 / 重复修订 1 / 冲突修订 1 / 修订 3 解除 + 乱序序列）
 ./scripts/seed.sh
 ```
 
-环境变量：`DATABASE_URL`（默认 `postgres://localhost:5433/storm_warning?sslmode=disable`）、`LISTEN_ADDR`（默认 `:8080`）、`TEST_DATABASE_URL`（仅测试）。
+环境变量：`DATABASE_URL`（默认 `postgres://localhost:5433/storm_warning?sslmode=disable`）、`LISTEN_ADDR`（默认 `:8080`）、`TEST_DATABASE_URL`（仅测试）；dispatcher 另有 `WEBHOOK_URL`、`POLL_INTERVAL`（默认 `1s`）、`BATCH_SIZE`（默认 `32`）。
 
 ## API 一览
 
@@ -85,6 +92,10 @@ DATABASE_URL="postgres://localhost:5433/storm_warning?sslmode=disable" go run ./
 | 同一 revision 并发提交 | `UNIQUE(source, external_id, revision)` + 序列级 `pg_advisory_xact_lock`；败者回滚后按指纹判定重放/冲突 | `TestConcurrentSameRevision`（16 并发 → 恰好 1 事件 / 1 outbox） |
 | 事件落库后、outbox 前失败 | 事件 + current + outbox 在同一事务；故障即整体回滚，重试安全 | `TestRollbackWhenOutboxFails`（注入故障 → 三表皆空 → 重试成功） |
 | 乱序 / 解除后收到旧修订 | 领域规则 `Decide`：只有更高修订才应用；解除同样只是“更高修订的一种” | `TestAppendLifecycle`（解除后 rev2 迟到，`late` 不复活）、`TestCurrentAsOf` |
+| 解除后恢复发布（rev4） | rev4 是更高修订，正常应用；rev3 解除记录是 append-only 事件，不受影响；重复提交 rev4 返回首次的事件与 outbox | `TestRev4AfterCancellation` |
+| 两个 worker 并发投递 | 认领用 `SELECT … FOR UPDATE SKIP LOCKED`，一行同一时刻只属一个 worker | `TestTwoWorkersNoDoubleClaim`（8 行 × 2 worker，每行恰好投递一次） |
+| 投递后、标记前崩溃 | 投递与标记在同一事务；崩溃回滚 → 重启按**同一 notification_id 重投**，下游凭身份幂等；事件流 / 当前状态 / as_of 均不被污染 | `TestCrashAfterDeliverBeforeMark` |
+| 下游故障重试 | `attempts` + `next_attempt_at` 指数退避，身份不变 | `TestRetryWithBackoff` |
 | 稳定排序 | 事件按 `BIGSERIAL id`；检索按主键 `(source, external_id)` keyset 分页 | `TestSearchStableOrderAndPagination`、审计轨迹断言 |
 | append-only | 触发器拒绝 `UPDATE`/`DELETE` | `TestAppendOnlyEnforced` |
 | as_of 与实时语义一致 | 实时与历史共用同一规则（“截止 t 已收到的最大修订”），`domain.AsOf` 单测 | `TestAsOf`、`TestCurrentAsOf` |
@@ -95,8 +106,15 @@ DATABASE_URL="postgres://localhost:5433/storm_warning?sslmode=disable" go run ./
 - 咨询锁以 `hashtextextended(source || \x1f || external_id)` 为键，只串行化同一事件序列的写入，不同序列完全并行；
 - 重放判定读取的是**已提交**的行（唯一冲突只会在对方提交后抛出），无脏读。
 
+## 通知投递（事务性 outbox）
+
+- 通知身份 `notification_id = source/external_id/revision`，由 `warning_outbox` 上的唯一约束保证一行通知对应一个身份；webhook 请求头携带 `X-Notification-ID`，下游按它幂等去重；
+- worker 循环：`SKIP LOCKED` 认领到期行（`dispatched_at IS NULL` 且 `next_attempt_at` 已过）→ 逐行投递 → 同事务标记；任何一行标记失败或进程崩溃，整批回滚等待重投；
+- 失败簿记：`attempts`、`next_attempt_at`（指数退避，1s/2s/4s…封顶 64s）、`last_error`；
+- 投递循环只读写 `warning_outbox`，不触碰事件流与当前状态——恢复重放不会污染 `current`、`as_of` 历史或审计轨迹。
+
 ## 数据模型
 
 - `warning_events`：append-only 事件流，唯一约束 `(source, external_id, revision)`，`fingerprint` 为规范化内容摘要；
 - `warning_current`：每个序列的当前有效状态（物化读模型，检索走这里）；
-- `warning_outbox`：状态变更通知（`dispatched_at IS NULL` 即待投递），与事件同事务写入。
+- `warning_outbox`：状态变更通知，唯一约束 `(source, external_id, revision)` 即通知身份，`dispatched_at IS NULL` 即待投递，`attempts` / `next_attempt_at` / `last_error` 支持退避重试；与事件同事务写入。
