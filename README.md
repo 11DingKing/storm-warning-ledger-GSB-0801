@@ -74,7 +74,12 @@
 | `locked_by` / `locked_at` | 当前认领 worker 与认领时间 |
 | `last_error` | 最近一次失败原因 |
 
-worker 用 `SELECT ... FOR UPDATE SKIP LOCKED` 认领一行并在同一事务里把 `status` 改为 `processing`，投递成功后置为 `dispatched`，失败则按指数退避重置为 `pending` 并更新 `next_retry_at`，超过 `max_attempts` 置为 `dead`。多个 worker 并发时同一行只会被一个 worker 认领；若 worker 在下游已接收但写 `dispatched_at` 前崩溃，事务回滚后行恢复为 `pending`，重放沿用**相同的 `notification_id`**，下游凭 `Idempotency-Key` 去重（at-least-once）。
+worker 采用**租约（lease）模式**：`ClaimPending` 用 `SELECT ... FOR UPDATE SKIP LOCKED` 认领一行，立即提交（`status='processing'`、`locked_at=now()`、`attempts+1`），投递在事务外进行；投递成功后置为 `dispatched`，失败则按退避重置为 `pending` 并更新 `next_retry_at`，连续失败达到 `max_attempts` 后置为 `dead`（可查询的终态，不再阻塞队列）。
+
+- **互斥认领**：认领查询只选 `status='pending' AND next_retry_at<=now()` 的行，配合 `FOR UPDATE SKIP LOCKED`，多个 worker 不会同时处理同一行。
+- **租约接管**：若 worker 崩溃或投递过慢，行停留在 `processing`；当 `locked_at < now() - lease_ttl` 时，另一个 worker 可以认领该过期租约并重投，保证不丢通知。租约 TTL 由 `--lease-duration` 配置。
+- **at-least-once + 幂等**：租约接管/崩溃重放沿用**相同的 `notification_id`**，并通过 `Idempotency-Key` 头发送给下游；下游去重后每个业务通知只生效一次（可能被投递多次）。
+- **毒消息终态**：连续失败 `max_attempts` 次（默认 10）后进入 `dead`，可通过 `GET /api/v1/outbox?include_dispatched=true` 查询 `status=dead` 与 `last_error`。
 
 ## HTTP API
 
@@ -179,16 +184,42 @@ DATABASE_URL="postgres:///warning_ledger?sslmode=disable" \
   go run ./cmd/worker --worker-id=B --downstream-url=http://127.0.0.1:9900/notify &
 ```
 
-`--once` 处理完当前 pending 后退出。模拟"下游已接收但本地未写 `dispatched_at` 崩溃"：
+`--once` 处理完当前 pending 后退出。worker 参数：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--lease-duration` | 30s | 认领租约 TTL；超过该时间仍为 `processing` 的行可被其他 worker 接管 |
+| `--backoff` | -1（指数 1s,2s…） | 失败后固定退避；`0` 表示立即重试（测试用） |
+| `--crash-after-deliver` | false | 首次投递成功后、写 `dispatched_at` 前退出，模拟崩溃 |
+| `--once` | false | 处理完当前 pending 后退出 |
+
+#### 租约接管（revision 4 崩溃后第二个 worker 接管）
 
 ```bash
-# 1) 投递成功后立刻退出（事务回滚，本地仍是 pending）
-go run ./cmd/worker --worker-id=crash --crash-after-deliver \
-  --downstream-url=http://127.0.0.1:9900/notify --once
-# 2) 正常 worker 重放，沿用相同 notification_id，下游去重
-go run ./cmd/worker --worker-id=recovery \
-  --downstream-url=http://127.0.0.1:9900/notify --once
+# 1) worker A 投递 rev4 后崩溃，行停留在 processing（认领已提交）
+go run ./cmd/worker --worker-id=crash-A --crash-after-deliver \
+  --lease-duration=2s --downstream-url=http://127.0.0.1:9900/notify --once
+# 2) 等待 --lease-duration 后，worker B 接管并重投，沿用相同 notification_id；
+#    下游凭 Idempotency-Key 去重，rev4 最终只有一个业务通知
+go run ./cmd/worker --worker-id=takeover-B \
+  --lease-duration=2s --downstream-url=http://127.0.0.1:9900/notify --once
 ```
+
+#### 毒消息进入 dead 终态
+
+```bash
+# 让下游对指定 notification_id 始终返回 500
+go run ./cmd/mock-downstream -port 9901 -fail cn-met/delivery-poison-01/1 &
+# 将该通知的 max_attempts 设为 3，用立即退避连续投递 3 次
+for i in 1 2 3; do
+  go run ./cmd/worker --downstream-url=http://127.0.0.1:9901/notify \
+    --lease-duration=10s --backoff=0 --once
+done
+# 第 3 次失败后 status=dead，可通过 API 查询：
+curl 'http://localhost:8080/api/v1/outbox?include_dispatched=true'
+```
+
+投递重试与 outbox 状态变化**只影响 `warning_outbox`**，不会改写 `warning_events`，因此当前状态、`as_of` 历史状态和 history 视图在任意次重试后保持不变。
 
 ### 7. 运行测试
 

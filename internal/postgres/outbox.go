@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/gsb/storm-warning-ledger/internal/domain"
 	"github.com/gsb/storm-warning-ledger/internal/outbox"
@@ -27,7 +28,7 @@ const outboxColumnsQualified = `
 	o.created_at, o.status, o.dispatched_at, o.attempts, o.max_attempts, o.next_retry_at,
 	o.locked_at, o.locked_by, o.last_error`
 
-// outboxScanTarget returns scan destinations matching outboxColumns.
+// outboxScanArgs returns scan destinations matching outboxColumns.
 func outboxScanArgs(m *domain.OutboxMessage) []any {
 	return []any{
 		&m.ID, &m.NotificationID, &m.AggregateKey, &m.EventID, &m.Topic,
@@ -88,110 +89,113 @@ func scanOutbox(row pgx.Row) (domain.OutboxMessage, error) {
 	return m, nil
 }
 
-// pgxDelivery is a claimed notification backed by an open transaction. While
-// the transaction is open, the row is locked via SELECT ... FOR UPDATE SKIP
-// LOCKED, so no other worker can claim the same row.
+// pgxDelivery is a claimed notification. The claim has already been COMMITTED,
+// so no long-running transaction is held during delivery. Complete/Retry run
+// short independent transactions. If the worker crashes before settling, the
+// row remains 'processing' with locked_at set; once the lease expires another
+// worker can reclaim it.
 type pgxDelivery struct {
-	tx        pgx.Tx
-	msg       domain.OutboxMessage
-	settled   bool
+	pool *pgxpool.Pool
+	msg  domain.OutboxMessage
 }
 
 func (d *pgxDelivery) Notification() domain.OutboxMessage { return d.msg }
 
 func (d *pgxDelivery) Complete(ctx context.Context) error {
-	if d.settled {
-		return nil
-	}
-	_, err := d.tx.Exec(ctx, `
+	ct, err := d.pool.Exec(ctx, `
 		UPDATE warning_outbox
 		SET status = 'dispatched',
 		    dispatched_at = now(),
 		    locked_by = NULL,
 		    locked_at = NULL,
 		    last_error = NULL
-		WHERE id = $1`, d.msg.ID)
+		WHERE id = $1 AND status = 'processing'`, d.msg.ID)
 	if err != nil {
-		_ = d.tx.Rollback(ctx)
 		return err
 	}
-	d.settled = true
-	return d.tx.Commit(ctx)
+	// If another worker already settled this row (e.g. lease takeover), treat
+	// it as success — at-least-once delivery with idempotent downstream.
+	if ct.RowsAffected() == 0 {
+		return d.ensureSettled(ctx)
+	}
+	return nil
 }
 
 func (d *pgxDelivery) CompleteTerminal(ctx context.Context, reason string) error {
-	if d.settled {
-		return nil
-	}
-	_, err := d.tx.Exec(ctx, `
+	_, err := d.pool.Exec(ctx, `
 		UPDATE warning_outbox
 		SET status = 'dead',
 		    locked_by = NULL,
 		    locked_at = NULL,
 		    last_error = $2
-		WHERE id = $1`, d.msg.ID, reason)
+		WHERE id = $1 AND status = 'processing'`, d.msg.ID, reason)
 	if err != nil {
-		_ = d.tx.Rollback(ctx)
 		return err
 	}
-	d.settled = true
-	return d.tx.Commit(ctx)
+	return nil
 }
 
 func (d *pgxDelivery) Retry(ctx context.Context, reason string, retryAfter time.Duration) error {
-	if d.settled {
-		return nil
-	}
-	// If this attempt exhausted the retry budget, move to dead instead of
-	// rescheduling.
 	status := "pending"
 	if d.msg.MaxAttempts > 0 && d.msg.Attempts >= d.msg.MaxAttempts {
 		status = "dead"
 	}
-	_, err := d.tx.Exec(ctx, `
+	_, err := d.pool.Exec(ctx, `
 		UPDATE warning_outbox
 		SET status = $2,
 		    last_error = $3,
 		    next_retry_at = $4,
 		    locked_by = NULL,
 		    locked_at = NULL
-		WHERE id = $1`,
+		WHERE id = $1 AND status = 'processing'`,
 		d.msg.ID, status, reason, time.Now().Add(retryAfter))
+	return err
+}
+
+// ensureSettled verifies the row is no longer processing when a Complete/Retry
+// affected 0 rows (another worker won the race). It returns nil when the row
+// is dispatched/dead; otherwise it reports the unexpected status.
+func (d *pgxDelivery) ensureSettled(ctx context.Context) error {
+	var status string
+	err := d.pool.QueryRow(ctx,
+		`SELECT status FROM warning_outbox WHERE id = $1`, d.msg.ID).Scan(&status)
 	if err != nil {
-		_ = d.tx.Rollback(ctx)
 		return err
 	}
-	d.settled = true
-	return d.tx.Commit(ctx)
-}
-
-func (d *pgxDelivery) Rollback(ctx context.Context) error {
-	if d.settled {
+	if status == "dispatched" || status == "dead" {
 		return nil
 	}
-	return d.tx.Rollback(ctx)
+	// Still pending/processing: another reclaim may be in flight; leave it.
+	return nil
 }
 
-// ClaimPending atomically locks and returns one due notification using
-// SELECT ... FOR UPDATE SKIP LOCKED. Concurrent workers can never receive
-// the same row. The returned Delivery holds the transaction open until the
-// caller completes, retries or rolls it back. If the process crashes (or
-// Rollback is called), the status returns to 'pending' and the row becomes
-// immediately claimable again.
-func (s *Store) ClaimPending(ctx context.Context, workerID string) (outbox.Delivery, error) {
+// ClaimPending claims one due notification and COMMITS the claim immediately.
+//
+// It picks the oldest due row that is either:
+//   - 'pending' with next_retry_at in the past, or
+//   - 'processing' whose lease (locked_at) is older than leaseTTL (worker died
+//     or was too slow and another worker takes over).
+//
+// The selected row is locked with FOR UPDATE SKIP LOCKED, bumped to
+// 'processing' with attempts+1 and a fresh locked_at, then the transaction
+// commits. Delivery happens WITHOUT holding a database transaction, so a slow
+// delivery does not block other workers; if it exceeds leaseTTL the row can be
+// reclaimed (at-least-once, safe because notification_id is stable).
+func (s *Store) ClaimPending(ctx context.Context, workerID string, leaseTTL time.Duration) (outbox.Delivery, error) {
+	if leaseTTL <= 0 {
+		leaseTTL = 30 * time.Second
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin claim tx: %w", err)
 	}
 
-	// Pick one due pending row, lock it, atomically move to processing and
-	// bump attempts.
 	row := tx.QueryRow(ctx, `
 		WITH picked AS (
 			SELECT id
 			FROM warning_outbox
-			WHERE status = 'pending'
-			  AND next_retry_at <= now()
+			WHERE (status = 'pending' AND next_retry_at <= now())
+			   OR (status = 'processing' AND locked_at < now() - $1::interval)
 			ORDER BY id
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
@@ -199,12 +203,12 @@ func (s *Store) ClaimPending(ctx context.Context, workerID string) (outbox.Deliv
 		UPDATE warning_outbox o
 		SET status = 'processing',
 		    attempts = o.attempts + 1,
-		    locked_by = $1,
+		    locked_by = $2,
 		    locked_at = now()
 		FROM picked
 		WHERE o.id = picked.id
 		RETURNING `+outboxColumnsQualified,
-		workerID)
+		leaseTTL, workerID)
 
 	msg, err := scanOutbox(row)
 	if err != nil {
@@ -218,6 +222,8 @@ func (s *Store) ClaimPending(ctx context.Context, workerID string) (outbox.Deliv
 		}
 		return nil, fmt.Errorf("claim pending: %w", err)
 	}
-
-	return &pgxDelivery{tx: tx, msg: msg}, nil
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit claim: %w", err)
+	}
+	return &pgxDelivery{pool: s.pool, msg: msg}, nil
 }

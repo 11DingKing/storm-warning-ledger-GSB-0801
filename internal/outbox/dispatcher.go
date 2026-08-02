@@ -2,10 +2,13 @@
 //
 // Persistence is provided by the postgres package via the Repository
 // interface. The dispatcher claims one due notification at a time using
-// SELECT ... FOR UPDATE SKIP LOCKED, so multiple workers never process the
-// same row simultaneously. Deliveries use the stable notification_key
+// SELECT ... FOR UPDATE SKIP LOCKED with a lease: the claim is committed
+// immediately (status='processing', locked_at set), delivery happens without
+// holding a transaction, and if the worker crashes before completing, the row
+// remains 'processing' until locked_at exceeds LeaseTTL, at which point another
+// worker reclaims it. Deliveries use the stable notification_id
 // (source/external_id/revision) as the downstream idempotency key, which is
-// reused on every redelivery after a crash or transient failure.
+// reused on every redelivery after a crash, lease takeover or transient failure.
 package outbox
 
 import (
@@ -22,32 +25,29 @@ import (
 	"github.com/gsb/storm-warning-ledger/internal/domain"
 )
 
-// Delivery is a single claimed notification. It holds an open database
-// transaction; exactly one of Complete, CompleteTerminal, Retry or Rollback
-// must be called.
+// Delivery is a single claimed notification. The claim has already been
+// committed; call exactly one of Complete, CompleteTerminal or Retry after
+// delivery. If the process crashes instead, the lease expires and another
+// worker reclaims the same notification_id.
 type Delivery interface {
 	// Notification returns the claimed outbox row.
 	Notification() domain.OutboxMessage
-	// Complete marks the notification dispatched and commits the claim tx.
+	// Complete marks the notification dispatched.
 	Complete(ctx context.Context) error
-	// CompleteTerminal marks the notification dispatched but records a
-	// terminal error, so a poison message does not block the queue.
+	// CompleteTerminal marks the notification dead (poison message).
 	CompleteTerminal(ctx context.Context, reason string) error
-	// Retry records the error, schedules a future attempt and commits the
-	// claim tx, releasing the row for redelivery.
+	// Retry records the error and reschedules the row; if the attempt budget
+	// is exhausted it moves to 'dead' instead of 'pending'.
 	Retry(ctx context.Context, reason string, retryAfter time.Duration) error
-	// Rollback abandons the claim without changing delivery state, releasing
-	// the row immediately. Used to simulate a crash: the downstream may have
-	// already received the message, but dispatched_at was never written.
-	Rollback(ctx context.Context) error
 }
 
 // Repository is the persistence contract required by the dispatcher. It is
 // implemented by *postgres.Store.
 type Repository interface {
-	// ClaimPending locks and returns one due, undispatched notification.
+	// ClaimPending locks and returns one due notification. It also reclaims
+	// 'processing' rows whose lease (locked_at) is older than leaseTTL.
 	// It returns ErrNoPending when nothing is available.
-	ClaimPending(ctx context.Context, workerID string) (Delivery, error)
+	ClaimPending(ctx context.Context, workerID string, leaseTTL time.Duration) (Delivery, error)
 }
 
 // ErrNoPending is returned by ClaimPending when no row is due right now.
@@ -136,6 +136,9 @@ func IsTerminal(err error) bool {
 type Config struct {
 	WorkerID     string
 	PollInterval time.Duration
+	// LeaseTTL is how long a 'processing' claim is considered valid. After
+	// this duration, another worker may reclaim the row (lease takeover).
+	LeaseTTL time.Duration
 	// Backoff computes the delay before the next attempt after a failure.
 	Backoff func(attempts int) time.Duration
 }
@@ -148,10 +151,10 @@ type Dispatcher struct {
 	logger    *log.Logger
 
 	// AfterDeliver, if non-nil, is invoked after a successful downstream
-	// delivery but before dispatched_at is written. If it returns true the
-	// dispatcher rolls back the claim (simulating a crash where the
-	// downstream already received the message but the local state was never
-	// updated), so the same notification_key will be redelivered.
+	// delivery but before the row is marked dispatched. If it returns true the
+	// dispatcher simulates a crash by leaving the row as 'processing' (no
+	// Complete call); after LeaseTTL another worker reclaims and redelivers
+	// the SAME notification_id (at-least-once, downstream dedupes).
 	AfterDeliver func(n domain.OutboxMessage) bool
 }
 
@@ -162,6 +165,9 @@ func NewDispatcher(repo Repository, deliverer Deliverer, cfg Config) *Dispatcher
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 500 * time.Millisecond
+	}
+	if cfg.LeaseTTL <= 0 {
+		cfg.LeaseTTL = 30 * time.Second
 	}
 	if cfg.Backoff == nil {
 		cfg.Backoff = defaultBackoff
@@ -234,7 +240,7 @@ func (d *Dispatcher) ProcessOnce(ctx context.Context) (int, error) {
 // ProcessOne claims, delivers and settles one notification. It returns false
 // with ErrNoPending when nothing was due.
 func (d *Dispatcher) ProcessOne(ctx context.Context) (bool, error) {
-	delivery, err := d.repo.ClaimPending(ctx, d.cfg.WorkerID)
+	delivery, err := d.repo.ClaimPending(ctx, d.cfg.WorkerID, d.cfg.LeaseTTL)
 	if err != nil {
 		return false, err
 	}
@@ -246,7 +252,7 @@ func (d *Dispatcher) ProcessOne(ctx context.Context) (bool, error) {
 			if cErr := delivery.CompleteTerminal(ctx, dErr.Error()); cErr != nil {
 				return true, cErr
 			}
-			d.logger.Printf("[%s] notification %s terminal: %v (marked done)",
+			d.logger.Printf("[%s] notification %s terminal: %v (marked dead)",
 				d.cfg.WorkerID, n.NotificationID, dErr)
 			return true, nil
 		}
@@ -259,10 +265,12 @@ func (d *Dispatcher) ProcessOne(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 
-	// Simulate crash after downstream ack but before local dispatch commit.
+	// Simulate a crash after successful downstream delivery but before marking
+	// dispatched. The claim is already committed, so the row stays
+	// 'processing' with locked_at set; after LeaseTTL another worker reclaims
+	// and redelivers with the SAME notification_id.
 	if d.AfterDeliver != nil && d.AfterDeliver(n) {
-		_ = delivery.Rollback(ctx)
-		d.logger.Printf("[%s] injected crash after downstream ack for %s",
+		d.logger.Printf("[%s] simulated crash after downstream ack for %s (lease will expire)",
 			d.cfg.WorkerID, n.NotificationID)
 		return true, nil
 	}
