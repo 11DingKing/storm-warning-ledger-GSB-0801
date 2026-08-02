@@ -12,10 +12,11 @@ import (
 type WarningRepository interface {
 	GetEvents(ctx context.Context, source, externalID string) ([]domain.WarningEvent, error)
 	GetMaxRevision(ctx context.Context, source, externalID string) (int, error)
-	InsertEventTx(ctx context.Context, in domain.WriteInput, opts repository.InsertEventOptions) (domain.WarningEvent, bool, bool, error)
+	InsertEventTx(ctx context.Context, in domain.WriteInput, opts repository.InsertEventOptions) (repository.InsertResult, error)
 	QueryWarnings(ctx context.Context, filter repository.WarningFilter) ([]domain.WarningState, int, error)
-	GetOutboxUnpublished(ctx context.Context, limit int) ([]repository.OutboxEvent, error)
-	MarkOutboxPublished(ctx context.Context, ids []int64) error
+	GetOutboxByNotification(ctx context.Context, notificationID string) (*domain.OutboxEvent, error)
+	GetOutboxByEvent(ctx context.Context, eventID int64) (*domain.OutboxEvent, error)
+	ListOutbox(ctx context.Context, limit int) ([]domain.OutboxEvent, error)
 }
 
 type WarningService struct {
@@ -30,7 +31,14 @@ type WriteOptions struct {
 	FailBeforeOutbox bool
 }
 
-func (s *WarningService) Write(ctx context.Context, in domain.WriteInput, opts WriteOptions) (*domain.WriteOutcome, error) {
+type WriteResponse struct {
+	Event           domain.WarningEvent  `json:"event"`
+	Outbox          *domain.OutboxEvent  `json:"outbox"`
+	Result          domain.WriteResult   `json:"result"`
+	CurrentRevision int                  `json:"current_revision"`
+}
+
+func (s *WarningService) Write(ctx context.Context, in domain.WriteInput, opts WriteOptions) (*WriteResponse, error) {
 	if err := in.Validate(); err != nil {
 		return nil, err
 	}
@@ -40,7 +48,7 @@ func (s *WarningService) Write(ctx context.Context, in domain.WriteInput, opts W
 		return nil, err
 	}
 
-	ev, duplicate, isLate, err := s.repo.InsertEventTx(ctx, in, repository.InsertEventOptions{
+	res, err := s.repo.InsertEventTx(ctx, in, repository.InsertEventOptions{
 		FailBeforeOutbox: opts.FailBeforeOutbox,
 	})
 	if err != nil {
@@ -49,9 +57,9 @@ func (s *WarningService) Write(ctx context.Context, in domain.WriteInput, opts W
 
 	result := domain.WriteResultApplied
 	switch {
-	case duplicate:
+	case res.IsDuplicate:
 		result = domain.WriteResultDuplicate
-	case isLate:
+	case res.IsLate:
 		result = domain.WriteResultLate
 	}
 
@@ -59,12 +67,16 @@ func (s *WarningService) Write(ctx context.Context, in domain.WriteInput, opts W
 	if in.Revision > currentRev {
 		currentRev = in.Revision
 	}
-	if duplicate {
+	if res.IsDuplicate {
 		currentRev = maxRev
 	}
 
-	return &domain.WriteOutcome{
-		Event:           ev,
+	// For duplicate revisions, InsertEventTx already returns the original
+	// outbox row with the stable notification_id, so retries/replays can
+	// never produce a second identity.
+	return &WriteResponse{
+		Event:           res.Event,
+		Outbox:          res.Outbox,
 		Result:          result,
 		CurrentRevision: currentRev,
 	}, nil
@@ -113,12 +125,12 @@ func (s *WarningService) ListWarnings(ctx context.Context, filter repository.War
 	return s.repo.QueryWarnings(ctx, filter)
 }
 
-func (s *WarningService) GetOutbox(ctx context.Context, limit int) ([]repository.OutboxEvent, error) {
-	return s.repo.GetOutboxUnpublished(ctx, limit)
+func (s *WarningService) ListOutbox(ctx context.Context, limit int) ([]domain.OutboxEvent, error) {
+	return s.repo.ListOutbox(ctx, limit)
 }
 
-func (s *WarningService) MarkPublished(ctx context.Context, ids []int64) error {
-	return s.repo.MarkOutboxPublished(ctx, ids)
+func (s *WarningService) GetOutboxNotification(ctx context.Context, notificationID string) (*domain.OutboxEvent, error) {
+	return s.repo.GetOutboxByNotification(ctx, notificationID)
 }
 
 func IsNotFound(err error) bool {

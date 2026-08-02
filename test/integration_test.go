@@ -252,7 +252,7 @@ func TestOutboxAtomicWithEvent(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM warning_events`).Scan(&eventCount); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM outbox`).Scan(&outboxCount); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM warning_outbox`).Scan(&outboxCount); err != nil {
 		t.Fatal(err)
 	}
 	if eventCount != 1 || outboxCount != 1 {
@@ -277,7 +277,7 @@ func TestOutboxFailureRollsBackEvent(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM warning_events`).Scan(&eventCount); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM outbox`).Scan(&outboxCount); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM warning_outbox`).Scan(&outboxCount); err != nil {
 		t.Fatal(err)
 	}
 	if eventCount != 0 {
@@ -298,7 +298,7 @@ func TestOutboxFailureRollsBackEvent(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM warning_events`).Scan(&eventCount); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM outbox`).Scan(&outboxCount); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM warning_outbox`).Scan(&outboxCount); err != nil {
 		t.Fatal(err)
 	}
 	if eventCount != 1 || outboxCount != 1 {
@@ -397,37 +397,39 @@ func TestHistoryIsStableSorted(t *testing.T) {
 	}
 }
 
-func TestOutboxPollingAndMarkPublished(t *testing.T) {
-	svc, _ := setupSvc(t)
+func TestOutboxDispatchFlow(t *testing.T) {
+	svc, repo := setupSvc(t)
+	_ = repo
 	ctx := context.Background()
 	t0 := time.Date(2026, 8, 3, 15, 0, 0, 0, time.UTC)
 
-	if _, err := svc.Write(ctx, baseInput(1, domain.SeverityYellow, domain.StatusActive, t0), service.WriteOptions{}); err != nil {
+	wr1, err := svc.Write(ctx, baseInput(1, domain.SeverityYellow, domain.StatusActive, t0), service.WriteOptions{})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.Write(ctx, baseInput(2, domain.SeverityOrange, domain.StatusActive, t0.Add(time.Hour)), service.WriteOptions{}); err != nil {
+	wr2, err := svc.Write(ctx, baseInput(2, domain.SeverityOrange, domain.StatusActive, t0.Add(time.Hour)), service.WriteOptions{})
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	pending, err := svc.GetOutbox(ctx, 100)
+	if wr1.Outbox == nil || wr2.Outbox == nil {
+		t.Fatal("outbox must be populated on write")
+	}
+	if wr1.Outbox.NotificationID != domain.NotificationID(testSource, testExtID, 1) {
+		t.Errorf("unexpected notification id: %s", wr1.Outbox.NotificationID)
+	}
+
+	// List pending outbox (status pending).
+	items, err := svc.ListOutbox(ctx, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending) != 2 {
-		t.Fatalf("expected 2 pending outbox events, got %d", len(pending))
+	if len(items) != 2 {
+		t.Fatalf("expected 2 outbox rows, got %d", len(items))
 	}
-	var ids []int64
-	for _, p := range pending {
-		ids = append(ids, p.ID)
-	}
-	if err := svc.MarkPublished(ctx, ids); err != nil {
-		t.Fatal(err)
-	}
-	again, err := svc.GetOutbox(ctx, 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(again) != 0 {
-		t.Errorf("expected 0 pending after publish, got %d", len(again))
+	for _, it := range items {
+		if it.Status != domain.DispatchPending {
+			t.Errorf("expected pending, got %s for %s", it.Status, it.NotificationID)
+		}
 	}
 }

@@ -41,6 +41,7 @@ func GetTestPool(t *testing.T) *pgxpool.Pool {
 func ResetDatabase(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS warning_outbox")
 	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS outbox")
 	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS warning_events")
 	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS schema_migrations")

@@ -43,6 +43,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/warnings", h.handleList)
 	mux.HandleFunc("GET /api/v1/warnings/{source}/{externalID}", h.handleGet)
 	mux.HandleFunc("GET /api/v1/warnings/{source}/{externalID}/history", h.handleHistory)
+	mux.HandleFunc("GET /api/v1/outbox", h.handleListOutbox)
+	mux.HandleFunc("GET /api/v1/outbox/{notificationID...}", h.handleGetOutbox)
 	mux.HandleFunc("GET /health", h.handleHealth)
 }
 
@@ -138,10 +140,10 @@ func (h *Handler) handleHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"source":       source,
-		"external_id":  externalID,
-		"events":       events,
-		"total":        len(events),
+		"source":      source,
+		"external_id": externalID,
+		"events":      events,
+		"total":       len(events),
 	})
 }
 
@@ -177,6 +179,42 @@ func (h *Handler) handleList(w http.ResponseWriter, r *http.Request) {
 		"limit":  filter.Limit,
 		"offset": filter.Offset,
 	})
+}
+
+func (h *Handler) handleListOutbox(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	items, err := h.svc.ListOutbox(r.Context(), limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items": items,
+		"total": len(items),
+	})
+}
+
+func (h *Handler) handleGetOutbox(w http.ResponseWriter, r *http.Request) {
+	notificationID := r.PathValue("notificationID")
+	if notificationID == "" {
+		writeError(w, http.StatusBadRequest, "notification_id is required")
+		return
+	}
+	ob, err := h.svc.GetOutboxNotification(r.Context(), notificationID)
+	if err != nil {
+		if service.IsNotFound(err) {
+			writeError(w, http.StatusNotFound, "outbox notification not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, ob)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

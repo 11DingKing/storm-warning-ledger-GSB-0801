@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
+	"storm-warning-ledger/internal/dispatch"
 	httpapi "storm-warning-ledger/internal/http"
 	"storm-warning-ledger/internal/repository"
 	"storm-warning-ledger/internal/service"
@@ -18,9 +20,11 @@ import (
 
 func main() {
 	var (
-		addr       = flag.String("addr", getEnv("API_ADDR", ":8080"), "HTTP listen address")
-		migrate    = flag.Bool("migrate", false, "Run migrations and exit")
-		migrateDown = flag.Bool("migrate-down", false, "Rollback last migration and exit")
+		addr         = flag.String("addr", getEnv("API_ADDR", ":8080"), "HTTP listen address")
+		migrate      = flag.Bool("migrate", false, "Run migrations and exit")
+		migrateDown  = flag.Bool("migrate-down", false, "Rollback last migration and exit")
+		workerCount  = flag.Int("workers", getEnvInt("WORKER_COUNT", 2), "Number of dispatch workers")
+		noWorker     = flag.Bool("no-worker", false, "Disable dispatch workers")
 	)
 	flag.Parse()
 
@@ -67,7 +71,7 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintln(w, `{"service":"storm-warning-ledger","version":"1.0.0"}`)
+		fmt.Fprintln(w, `{"service":"storm-warning-ledger","version":"1.1.0"}`)
 	})
 
 	srv := &http.Server{
@@ -77,6 +81,18 @@ func main() {
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
+	}
+
+	var workers []*dispatch.Worker
+	if !*noWorker && *workerCount > 0 {
+		sender := dispatch.LogDispatcher{}
+		for i := 0; i < *workerCount; i++ {
+			opts := dispatch.DefaultOptions(fmt.Sprintf("worker-%d", i+1))
+			w := dispatch.NewWorker(opts, repo, sender)
+			w.Start(ctx)
+			workers = append(workers, w)
+		}
+		log.Printf("started %d dispatch worker(s)", *workerCount)
 	}
 
 	go func() {
@@ -95,6 +111,9 @@ func main() {
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown error: %v", err)
+	}
+	for _, w := range workers {
+		w.Stop()
 	}
 	log.Println("server stopped")
 }
@@ -121,6 +140,15 @@ func (rw *responseWriter) WriteHeader(code int) {
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
 	return fallback
 }

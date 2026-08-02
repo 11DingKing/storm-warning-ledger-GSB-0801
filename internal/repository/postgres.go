@@ -4,43 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"storm-warning-ledger/internal/domain"
 )
-
-const uniqueViolationCode = "23505"
-
-type ErrUniqueViolation struct {
-	Constraint string
-}
-
-func (e *ErrUniqueViolation) Error() string {
-	return fmt.Sprintf("unique violation: %s", e.Constraint)
-}
-
-func isUniqueViolation(err error, constraint string) bool {
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		if pgErr.Code == uniqueViolationCode {
-			if constraint == "" || pgErr.ConstraintName == constraint {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-type Repository interface {
-	Ping(ctx context.Context) error
-	GetEvents(ctx context.Context, source, externalID string) ([]domain.WarningEvent, error)
-	GetMaxRevision(ctx context.Context, source, externalID string) (int, error)
-	InsertEventTx(ctx context.Context, in domain.WriteInput) (ev domain.WarningEvent, isDuplicate bool, isLate bool, err error)
-}
 
 type PostgresRepository struct {
 	pool *pgxpool.Pool
@@ -127,14 +96,21 @@ type InsertEventOptions struct {
 	FailBeforeOutbox bool
 }
 
-func (r *PostgresRepository) InsertEventTx(ctx context.Context, in domain.WriteInput, opts InsertEventOptions) (ev domain.WarningEvent, isDuplicate bool, isLate bool, err error) {
+type InsertResult struct {
+	Event       domain.WarningEvent
+	Outbox      *domain.OutboxEvent
+	IsDuplicate bool
+	IsLate      bool
+}
+
+func (r *PostgresRepository) InsertEventTx(ctx context.Context, in domain.WriteInput, opts InsertEventOptions) (result InsertResult, err error) {
 	if err = in.Validate(); err != nil {
-		return ev, false, false, err
+		return result, err
 	}
 
 	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
-		return ev, false, false, err
+		return result, err
 	}
 	defer func() {
 		if err != nil {
@@ -142,9 +118,9 @@ func (r *PostgresRepository) InsertEventTx(ctx context.Context, in domain.WriteI
 		}
 	}()
 
-	eventType := string(domain.EventTypeUpdate)
+	eventType := domain.EventTypeUpdate
 	if in.Status == domain.StatusCancelled {
-		eventType = string(domain.EventTypeCancel)
+		eventType = domain.EventTypeCancel
 	}
 
 	payloadJSON := marshalJSON(in.Payload)
@@ -159,13 +135,13 @@ func (r *PostgresRepository) InsertEventTx(ctx context.Context, in domain.WriteI
 		in.Source, in.ExternalID,
 	).Scan(&maxRevision)
 	if err != nil {
-		return ev, false, false, err
+		return result, err
 	}
 	currentMax := 0
 	if maxRevision != nil {
 		currentMax = *maxRevision
 	}
-	isLate = in.Revision < currentMax
+	result.IsLate = in.Revision < currentMax
 
 	row := tx.QueryRow(ctx,
 		`INSERT INTO warning_events
@@ -177,54 +153,51 @@ func (r *PostgresRepository) InsertEventTx(ctx context.Context, in domain.WriteI
 		in.Source, in.ExternalID, in.Revision, eventType,
 		in.WarningType, in.Severity, in.Status,
 		in.IssuedAt, in.EffectiveAt, in.ExpiresAt,
-		regions, payloadJSON, isLate,
+		regions, payloadJSON, result.IsLate,
 	)
 
 	inserted := true
-	ev, err = scanEvent(row)
+	ev, err := scanEvent(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			inserted = false
-			isDuplicate = true
+			result.IsDuplicate = true
 			ev, err = r.getEventByRevision(ctx, tx, in.Source, in.ExternalID, in.Revision)
 			if err != nil {
-				return ev, false, false, err
+				return result, err
 			}
 		} else {
-			return ev, false, false, err
+			return result, err
 		}
 	}
+	result.Event = ev
 
 	if inserted {
 		if opts.FailBeforeOutbox {
-			return ev, false, isLate, fmt.Errorf("forced failure before outbox write (simulating crash)")
+			return result, fmt.Errorf("forced failure before outbox write (simulating crash)")
 		}
 
-		outboxPayload := map[string]any{
-			"source":       in.Source,
-			"external_id":  in.ExternalID,
-			"revision":     in.Revision,
-			"event_type":   eventType,
-			"warning_type": in.WarningType,
-			"severity":     in.Severity,
-			"status":       in.Status,
-			"is_late":      isLate,
+		outbox, insErr := insertOutboxInTx(ctx, tx, ev)
+		if insErr != nil {
+			err = insErr
+			return result, err
 		}
-		_, err = tx.Exec(ctx,
-			`INSERT INTO outbox (event_id, aggregate_key, event_type, payload)
-			 VALUES ($1, $2, $3, $4)`,
-			ev.ID, ev.AggregateKey(), eventType, marshalJSON(outboxPayload),
-		)
-		if err != nil {
-			return ev, false, isLate, err
+		result.Outbox = outbox
+	} else {
+		// Duplicate revision: return the existing outbox row unchanged so the
+		// caller always sees the first notification identity for that revision.
+		ob, getErr := getOutboxByEventInTx(ctx, tx, ev.ID)
+		if getErr != nil && !errors.Is(getErr, pgx.ErrNoRows) {
+			return result, getErr
 		}
+		result.Outbox = ob
 	}
 
 	if err = tx.Commit(ctx); err != nil {
-		return ev, false, isLate, err
+		return result, err
 	}
 
-	return ev, isDuplicate, isLate, nil
+	return result, nil
 }
 
 func (r *PostgresRepository) getEventByRevision(ctx context.Context, tx pgx.Tx, source, externalID string, revision int) (domain.WarningEvent, error) {
@@ -346,54 +319,4 @@ type WarningFilter struct {
 	RegionCode  string
 	Limit       int
 	Offset      int
-}
-
-func (r *PostgresRepository) GetOutboxUnpublished(ctx context.Context, limit int) ([]OutboxEvent, error) {
-	if limit <= 0 {
-		limit = 100
-	}
-	rows, err := r.pool.Query(ctx,
-		`SELECT id, event_id, aggregate_key, event_type, payload, created_at
-		 FROM outbox
-		 WHERE published_at IS NULL
-		 ORDER BY id ASC
-		 LIMIT $1`,
-		limit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []OutboxEvent
-	for rows.Next() {
-		var o OutboxEvent
-		var payload []byte
-		if err := rows.Scan(&o.ID, &o.EventID, &o.AggregateKey, &o.EventType, &payload, &o.CreatedAt); err != nil {
-			return nil, err
-		}
-		_ = unmarshalJSON(payload, &o.Payload)
-		out = append(out, o)
-	}
-	return out, rows.Err()
-}
-
-func (r *PostgresRepository) MarkOutboxPublished(ctx context.Context, ids []int64) error {
-	if len(ids) == 0 {
-		return nil
-	}
-	_, err := r.pool.Exec(ctx,
-		`UPDATE outbox SET published_at = $1 WHERE id = ANY($2)`,
-		time.Now().UTC(), ids,
-	)
-	return err
-}
-
-type OutboxEvent struct {
-	ID           int64          `json:"id"`
-	EventID      int64          `json:"event_id"`
-	AggregateKey string         `json:"aggregate_key"`
-	EventType    string         `json:"event_type"`
-	Payload      map[string]any `json:"payload"`
-	CreatedAt    time.Time      `json:"created_at"`
 }
