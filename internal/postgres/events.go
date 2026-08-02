@@ -48,16 +48,16 @@ const eventColumns = `
 	payload, received_at, recorded_at`
 
 // Ingest atomically appends an event and an outbox notification.
-func (s *Store) Ingest(ctx context.Context, in domain.IngestInput) (domain.Event, bool, error) {
+func (s *Store) Ingest(ctx context.Context, in domain.IngestInput) (domain.Event, domain.OutboxMessage, bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return domain.Event{}, false, fmt.Errorf("begin tx: %w", err)
+		return domain.Event{}, domain.OutboxMessage{}, false, fmt.Errorf("begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	payloadBytes, err := json.Marshal(in.Payload)
 	if err != nil {
-		return domain.Event{}, false, fmt.Errorf("marshal payload: %w", err)
+		return domain.Event{}, domain.OutboxMessage{}, false, fmt.Errorf("marshal payload: %w", err)
 	}
 
 	eventType := domain.EventTypeFor(in.Status)
@@ -85,28 +85,30 @@ func (s *Store) Ingest(ctx context.Context, in domain.IngestInput) (domain.Event
 		// duplicates rather than 500s.
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			existing, gErr := s.getEventByRevision(ctx, tx, in.Source, in.ExternalID, in.Revision)
+			existing, ob, gErr := s.getEventAndOutboxByRevision(ctx, tx, in.Source, in.ExternalID, in.Revision)
 			if gErr != nil {
-				return domain.Event{}, false, gErr
+				return domain.Event{}, domain.OutboxMessage{}, false, gErr
 			}
 			if cErr := tx.Commit(ctx); cErr != nil {
-				return domain.Event{}, false, cErr
+				return domain.Event{}, domain.OutboxMessage{}, false, cErr
 			}
-			return existing, false, nil
+			return existing, ob, false, nil
 		}
-		return domain.Event{}, false, fmt.Errorf("insert event: %w", err)
+		return domain.Event{}, domain.OutboxMessage{}, false, fmt.Errorf("insert event: %w", err)
 	}
 
 	if errors.Is(err, pgx.ErrNoRows) {
-		// Idempotent duplicate: return the existing event, write no new rows.
-		existing, gErr := s.getEventByRevision(ctx, tx, in.Source, in.ExternalID, in.Revision)
+		// Idempotent duplicate: return the existing event AND its outbox row,
+		// write no new rows. The outbox notification_key is therefore always
+		// the first one ever created for this revision.
+		existing, ob, gErr := s.getEventAndOutboxByRevision(ctx, tx, in.Source, in.ExternalID, in.Revision)
 		if gErr != nil {
-			return domain.Event{}, false, gErr
+			return domain.Event{}, domain.OutboxMessage{}, false, gErr
 		}
 		if cErr := tx.Commit(ctx); cErr != nil {
-			return domain.Event{}, false, cErr
+			return domain.Event{}, domain.OutboxMessage{}, false, cErr
 		}
-		return existing, false, nil
+		return existing, ob, false, nil
 	}
 
 	event := domain.Event{
@@ -133,42 +135,62 @@ func (s *Store) Ingest(ctx context.Context, in domain.IngestInput) (domain.Event
 	// Rollback, so the event row is also undone. Retrying then succeeds
 	// atomically. This proves event+outbox atomicity and rollback.
 	if ctx.Value(failBeforeOutboxKey{}) != nil {
-		return domain.Event{}, false, ErrInjectedFailure
+		return domain.Event{}, domain.OutboxMessage{}, false, ErrInjectedFailure
 	}
 
 	outboxPayload := map[string]any{
-		"event_id":      event.ID,
-		"source":        event.Source,
-		"external_id":   event.ExternalID,
-		"revision":      event.Revision,
-		"event_type":    string(event.EventType),
-		"warning_type":  string(event.WarningType),
-		"severity":      string(event.Severity),
-		"area_code":     event.AreaCode,
-		"status":        string(event.Status),
-		"received_at":   event.ReceivedAt,
+		"event_id":         event.ID,
+		"source":           event.Source,
+		"external_id":      event.ExternalID,
+		"revision":         event.Revision,
+		"event_type":       string(event.EventType),
+		"warning_type":     string(event.WarningType),
+		"severity":         string(event.Severity),
+		"area_code":        event.AreaCode,
+		"status":           string(event.Status),
+		"received_at":      event.ReceivedAt,
+		"notification_id":  event.NotificationID(),
 	}
 	outboxBytes, mErr := json.Marshal(outboxPayload)
 	if mErr != nil {
-		return domain.Event{}, false, fmt.Errorf("marshal outbox: %w", mErr)
+		return domain.Event{}, domain.OutboxMessage{}, false, fmt.Errorf("marshal outbox: %w", mErr)
 	}
 
 	topic := "warning.revision"
 	if eventType == domain.EventCancellation {
 		topic = "warning.cancelled"
 	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO outbox (aggregate_key, event_id, topic, payload)
-		VALUES ($1, $2, $3, $4)`,
-		event.AggregateKey(), event.ID, topic, outboxBytes,
-	); err != nil {
-		return domain.Event{}, false, fmt.Errorf("insert outbox: %w", err)
+	var ob domain.OutboxMessage
+	err = tx.QueryRow(ctx, `
+		INSERT INTO warning_outbox
+			(aggregate_key, event_id, topic, payload, notification_id, status, next_retry_at)
+		VALUES ($1, $2, $3, $4, $5, 'pending', now())
+		RETURNING `+outboxColumns,
+		event.AggregateKey(), event.ID, topic, outboxBytes, event.NotificationID(),
+	).Scan(outboxScanArgs(&ob)...)
+	if err != nil {
+		return domain.Event{}, domain.OutboxMessage{}, false, fmt.Errorf("insert outbox: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return domain.Event{}, false, fmt.Errorf("commit: %w", err)
+		return domain.Event{}, domain.OutboxMessage{}, false, fmt.Errorf("commit: %w", err)
 	}
-	return event, true, nil
+	return event, ob, true, nil
+}
+
+func (s *Store) getEventAndOutboxByRevision(ctx context.Context, q pgxQuerier, source, externalID string, revision int) (domain.Event, domain.OutboxMessage, error) {
+	ev, err := s.getEventByRevision(ctx, q, source, externalID, revision)
+	if err != nil {
+		return domain.Event{}, domain.OutboxMessage{}, err
+	}
+	ob, err := scanOutbox(q.QueryRow(ctx, `
+		SELECT `+outboxColumns+`
+		FROM warning_outbox
+		WHERE event_id=$1`, ev.ID))
+	if err != nil {
+		return domain.Event{}, domain.OutboxMessage{}, fmt.Errorf("load outbox for event %d: %w", ev.ID, err)
+	}
+	return ev, ob, nil
 }
 
 func (s *Store) getEventByRevision(ctx context.Context, q pgxQuerier, source, externalID string, revision int) (domain.Event, error) {
@@ -366,15 +388,15 @@ func (s *Store) Search(ctx context.Context, f domain.SearchFilter) (domain.Searc
 }
 
 // ListOutbox returns outbox rows, newest first.
-func (s *Store) ListOutbox(ctx context.Context, includePublished bool, limit int) ([]domain.OutboxMessage, error) {
+func (s *Store) ListOutbox(ctx context.Context, includeDispatched bool, limit int) ([]domain.OutboxMessage, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	q := `
-		SELECT id, aggregate_key, event_id, topic, payload, created_at, published_at
-		FROM outbox`
-	if !includePublished {
-		q += ` WHERE published_at IS NULL`
+		SELECT ` + outboxColumns + `
+		FROM warning_outbox`
+	if !includeDispatched {
+		q += ` WHERE status IN ('pending','processing')`
 	}
 	q += ` ORDER BY id DESC LIMIT $1`
 
@@ -386,22 +408,11 @@ func (s *Store) ListOutbox(ctx context.Context, includePublished bool, limit int
 
 	var msgs []domain.OutboxMessage
 	for rows.Next() {
-		var (
-			m            domain.OutboxMessage
-			payloadBytes []byte
-		)
-		if err := rows.Scan(
-			&m.ID, &m.AggregateKey, &m.EventID, &m.Topic, &payloadBytes,
-			&m.CreatedAt, &m.PublishedAt,
-		); err != nil {
+		ob, err := scanOutbox(rows)
+		if err != nil {
 			return nil, err
 		}
-		if len(payloadBytes) > 0 {
-			if err := json.Unmarshal(payloadBytes, &m.Payload); err != nil {
-				return nil, err
-			}
-		}
-		msgs = append(msgs, m)
+		msgs = append(msgs, ob)
 	}
 	return msgs, rows.Err()
 }
@@ -412,7 +423,7 @@ func (s *Store) CountEventsAndOutbox(ctx context.Context) (int64, int64, error) 
 	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM warning_events`).Scan(&events); err != nil {
 		return 0, 0, err
 	}
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM outbox`).Scan(&outbox); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM warning_outbox`).Scan(&outbox); err != nil {
 		return 0, 0, err
 	}
 	return events, outbox, nil

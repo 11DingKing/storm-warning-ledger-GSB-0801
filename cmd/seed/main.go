@@ -53,7 +53,7 @@ func main() {
 	}
 
 	// Start from a clean slate for the demo aggregate so reruns are stable.
-	if _, err := pool.Exec(ctx, `TRUNCATE warning_events, outbox RESTART IDENTITY CASCADE`); err != nil {
+	if _, err := pool.Exec(ctx, `TRUNCATE warning_events, warning_outbox RESTART IDENTITY CASCADE`); err != nil {
 		log.Fatalf("truncate: %v", err)
 	}
 
@@ -118,7 +118,8 @@ func main() {
 		log.Fatalf("list outbox: %v", err)
 	}
 	for _, m := range msgs {
-		fmt.Printf("outbox id=%d event_id=%d topic=%s payload=%s\n", m.ID, m.EventID, m.Topic, asJSON(m.Payload))
+		fmt.Printf("outbox id=%d event_id=%d notification_id=%s topic=%s status=%s attempts=%d payload=%s\n",
+			m.ID, m.EventID, m.NotificationID, m.Topic, m.Status, m.Attempts, asJSON(m.Payload))
 	}
 
 	events, outbox, err := store.CountEventsAndOutbox(ctx)

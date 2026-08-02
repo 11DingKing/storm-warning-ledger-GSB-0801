@@ -31,6 +31,25 @@ type IngestResponse struct {
 	Created      bool             `json:"created"`
 	Deduplicated bool             `json:"deduplicated"`
 	Event        EventResponse    `json:"event"`
+	Outbox       OutboxResponse   `json:"outbox"`
+}
+
+// OutboxResponse is the JSON representation of an outbox notification.
+type OutboxResponse struct {
+	ID             int64          `json:"id"`
+	NotificationID string         `json:"notification_id"`
+	AggregateKey   string         `json:"aggregate_key"`
+	EventID        int64          `json:"event_id"`
+	Topic          string         `json:"topic"`
+	Payload        map[string]any `json:"payload,omitempty"`
+	CreatedAt      time.Time      `json:"created_at"`
+	Status         string         `json:"status"`
+	DispatchedAt   *time.Time     `json:"dispatched_at,omitempty"`
+	Attempts       int            `json:"attempts"`
+	MaxAttempts    int            `json:"max_attempts"`
+	NextRetryAt    *time.Time     `json:"next_retry_at,omitempty"`
+	LastError      string         `json:"last_error,omitempty"`
+	LockedBy       string         `json:"locked_by,omitempty"`
 }
 
 // EventResponse is the JSON representation of one stored event.
@@ -98,6 +117,25 @@ type SearchResponse struct {
 // ErrorResponse is a uniform error body.
 type ErrorResponse struct {
 	Error string `json:"error"`
+}
+
+func toOutboxResponse(m domain.OutboxMessage) OutboxResponse {
+	return OutboxResponse{
+		ID:             m.ID,
+		NotificationID: m.NotificationID,
+		AggregateKey:   m.AggregateKey,
+		EventID:        m.EventID,
+		Topic:          m.Topic,
+		Payload:        m.Payload,
+		CreatedAt:      m.CreatedAt,
+		Status:         m.Status,
+		DispatchedAt:   m.DispatchedAt,
+		Attempts:       m.Attempts,
+		MaxAttempts:    m.MaxAttempts,
+		NextRetryAt:    m.NextRetryAt,
+		LastError:      m.LastError,
+		LockedBy:       m.LockedBy,
+	}
 }
 
 func toEventResponse(e domain.Event) EventResponse {

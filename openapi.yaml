@@ -135,6 +135,32 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /api/v1/outbox:
+    get:
+      summary: List outbox notifications
+      description: |
+        Returns outbox rows newest first. By default only pending/processing
+        (undispatched) rows are returned; set include_dispatched=true to see all.
+      parameters:
+        - name: include_dispatched
+          in: query
+          schema: { type: boolean, default: false }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 100, maximum: 500 }
+      responses:
+        '200':
+          description: Outbox page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total: { type: integer }
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/OutboxMessage' }
+
   /healthz:
     get:
       summary: Liveness probe
@@ -243,6 +269,30 @@ components:
         created: { type: boolean }
         deduplicated: { type: boolean }
         event: { $ref: '#/components/schemas/EventResponse' }
+        outbox: { $ref: '#/components/schemas/OutboxMessage' }
+
+    OutboxMessage:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        notification_id:
+          type: string
+          description: Stable identity source/external_id/revision, reused on every redelivery.
+          example: cn-met/rainstorm-2026-0801-hb-001/4
+        aggregate_key: { type: string }
+        event_id: { type: integer, format: int64 }
+        topic: { type: string, enum: [warning.revision, warning.cancelled] }
+        payload: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+        status:
+          type: string
+          enum: [pending, processing, dispatched, dead]
+        dispatched_at: { type: string, format: date-time, nullable: true }
+        attempts: { type: integer }
+        max_attempts: { type: integer }
+        next_retry_at: { type: string, format: date-time, nullable: true }
+        last_error: { type: string, nullable: true }
+        locked_by: { type: string, nullable: true }
 
     StateResponse:
       type: object

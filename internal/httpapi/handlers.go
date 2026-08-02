@@ -28,6 +28,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/warnings/{source}/{external_id}", h.current)
 	mux.HandleFunc("GET /api/v1/warnings/{source}/{external_id}/history", h.history)
 	mux.HandleFunc("GET /api/v1/warnings/{source}/{external_id}/as-of", h.asOf)
+	mux.HandleFunc("GET /api/v1/outbox", h.listOutbox)
 	mux.HandleFunc("GET /healthz", h.health)
 }
 
@@ -69,6 +70,7 @@ func (h *Handler) ingest(w http.ResponseWriter, r *http.Request) {
 		Created:      result.Created,
 		Deduplicated: result.Deduplicated,
 		Event:        toEventResponse(result.Event),
+		Outbox:       toOutboxResponse(result.Outbox),
 	}
 	status := http.StatusOK
 	if result.Created {
@@ -187,6 +189,28 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 		items = append(items, toStateResponse(it))
 	}
 	writeJSON(w, http.StatusOK, SearchResponse{Total: page.Total, Items: items})
+}
+
+func (h *Handler) listOutbox(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	includeDispatched := q.Get("include_dispatched") == "true"
+	limit := 100
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+
+	msgs, err := h.svc.ListOutbox(r.Context(), includeDispatched, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	items := make([]OutboxResponse, 0, len(msgs))
+	for _, m := range msgs {
+		items = append(items, toOutboxResponse(m))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"total": len(items), "items": items})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

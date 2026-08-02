@@ -3,6 +3,7 @@ package domain
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -88,9 +89,18 @@ func (e Event) AggregateKey() string {
 	return e.Source + ":" + e.ExternalID
 }
 
+// NotificationID returns the stable identity used for the outbox notification
+// and as the downstream idempotency key. It is source/external_id/revision and
+// is identical across redeliveries of the same revision, e.g.
+// cn-met/rainstorm-2026-0801-hb-001/4.
+func (e Event) NotificationID() string {
+	return e.Source + "/" + e.ExternalID + "/" + strconv.Itoa(e.Revision)
+}
+
 // IngestResult is returned after processing an ingest command.
 type IngestResult struct {
-	Event        Event `json:"event"`
+	Event        Event         `json:"event"`
+	Outbox       OutboxMessage `json:"outbox"`
 	// Created is false when the (source, external_id, revision) already
 	// existed and the request was deduplicated idempotently.
 	Created      bool  `json:"created"`

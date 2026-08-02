@@ -47,7 +47,7 @@ func truncate(t *testing.T) {
 	t.Helper()
 	ctx := context.Background()
 	pool := testStore.Pool()
-	if _, err := pool.Exec(ctx, `TRUNCATE warning_events, outbox RESTART IDENTITY CASCADE`); err != nil {
+	if _, err := pool.Exec(ctx, `TRUNCATE warning_events, warning_outbox RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 }

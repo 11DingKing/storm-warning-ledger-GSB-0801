@@ -44,22 +44,20 @@ CREATE INDEX IF NOT EXISTS idx_warning_events_received
 
 -- Outbox: notification rows are inserted in the SAME transaction as the event
 -- they describe, so event persistence and notification enqueue are atomic.
-CREATE TABLE IF NOT EXISTS outbox (
-    id             BIGSERIAL PRIMARY KEY,
+-- Dispatch columns (status, notification_id, attempts, retries) are added in
+-- 0002_outbox_delivery.
+CREATE TABLE IF NOT EXISTS warning_outbox (
+    id             BIGSERIAL,
     aggregate_key  TEXT        NOT NULL,
     event_id       BIGINT      NOT NULL REFERENCES warning_events(id) ON DELETE CASCADE,
     topic          TEXT        NOT NULL,
     payload        JSONB       NOT NULL,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    published_at   TIMESTAMPTZ
+    CONSTRAINT outbox_pkey PRIMARY KEY (id)
 );
 
 -- One outbox row per event.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_event_unique ON outbox (event_id);
-
-CREATE INDEX IF NOT EXISTS idx_outbox_unpublished
-    ON outbox (id)
-    WHERE published_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_event_unique ON warning_outbox (event_id);
 
 -- Track applied migrations so the migrator is idempotent and ordered.
 CREATE TABLE IF NOT EXISTS schema_migrations (

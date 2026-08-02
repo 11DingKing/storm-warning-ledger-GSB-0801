@@ -20,14 +20,19 @@
 .
 ├── cmd/
 │   ├── server/            # API 服务入口（自动迁移）
-│   └── seed/              # 5 条消息场景走通 HTTP 的演示程序
+│   ├── seed/              # 5 条消息场景走通 HTTP 的演示程序
+│   ├── seed-cnmet/        # cn-met rev1→4（解除后重发 red）场景
+│   ├── worker/            # outbox 投递 worker（可多实例并发）
+│   └── mock-downstream/   # 测试用下游（按 Idempotency-Key 去重）
 ├── internal/
 │   ├── config/            # 环境变量配置
 │   ├── domain/            # 领域模型、状态推导纯函数、服务接口
-│   ├── postgres/         # 连接池、迁移器、事务存储、outbox
+│   ├── postgres/          # 连接池、迁移器、事务存储、认领投递
+│   ├── outbox/            # 分发器、HTTP 投递器、SKIP LOCKED 认领
 │   └── httpapi/           # JSON HTTP handler、路由、DTO
 ├── migrations_sql/        # 由 go:embed 打包进二进制的 SQL 迁移
-│   └── 0001_init.sql
+│   ├── 0001_init.sql
+│   └── 0002_outbox_delivery.sql
 ├── tests/                 # 针对真实 PostgreSQL 的并发集成测试
 ├── openapi.yaml           # OpenAPI 3.0 规范
 └── go.mod
@@ -55,9 +60,21 @@
 唯一约束：`UNIQUE(source, external_id, revision)` —— 幂等的根基。
 当前状态排序：`revision DESC, id ASC` —— 高修订获胜，同修订取最早记录，**稳定且确定**。
 
-### `outbox`（事务性发件箱）
+### `warning_outbox`（事务性发件箱 + 可投递队列）
 
-每个新事件在**同一事务**中写入一条 outbox 行（`UNIQUE(event_id)`），由独立的 relay 进程轮询 `published_at IS NULL` 发布。事件与通知要么同时提交，要么同时回滚。
+每个新事件在**同一事务**中写入一条 `warning_outbox` 行（`UNIQUE(event_id)`、`UNIQUE(notification_id)`），事件与通知要么同时提交，要么同时回滚。投递相关列由 `0002_outbox_delivery.sql` 增加：
+
+| 列 | 说明 |
+| --- | --- |
+| `notification_id` | 稳定通知身份 `source/external_id/revision`，重放时不变，作为下游 `Idempotency-Key` |
+| `status` | `pending` / `processing` / `dispatched` / `dead` |
+| `attempts` / `max_attempts` | 投递次数与上限（默认 10） |
+| `next_retry_at` | 下次可认领时间（失败退避） |
+| `dispatched_at` | 成功投递时间 |
+| `locked_by` / `locked_at` | 当前认领 worker 与认领时间 |
+| `last_error` | 最近一次失败原因 |
+
+worker 用 `SELECT ... FOR UPDATE SKIP LOCKED` 认领一行并在同一事务里把 `status` 改为 `processing`，投递成功后置为 `dispatched`，失败则按指数退避重置为 `pending` 并更新 `next_retry_at`，超过 `max_attempts` 置为 `dead`。多个 worker 并发时同一行只会被一个 worker 认领；若 worker 在下游已接收但写 `dispatched_at` 前崩溃，事务回滚后行恢复为 `pending`，重放沿用**相同的 `notification_id`**，下游凭 `Idempotency-Key` 去重（at-least-once）。
 
 ## HTTP API
 
@@ -68,6 +85,7 @@
 | GET | `/api/v1/warnings/{source}/{external_id}` | 当前有效状态 |
 | GET | `/api/v1/warnings/{source}/{external_id}/history` | 完整事件流（含 superseded 标记） |
 | GET | `/api/v1/warnings/{source}/{external_id}/as-of?at=<RFC3339>` | 指定时刻的历史状态 |
+| GET | `/api/v1/outbox?include_dispatched=false` | 查询 outbox 通知（含 `notification_id`/`status`/`attempts`） |
 | GET | `/healthz` | 健康检查 |
 
 写入请求体示例：
@@ -111,10 +129,11 @@ DATABASE_URL="postgres:///warning_ledger?sslmode=disable" \
   go run ./cmd/server -migrate
 ```
 
-或直接用 psql：
+或直接用 psql（按顺序执行两个迁移）：
 
 ```bash
 psql -d warning_ledger -f internal/postgres/migrations_sql/0001_init.sql
+psql -d warning_ledger -f internal/postgres/migrations_sql/0002_outbox_delivery.sql
 ```
 
 ### 3. 启动 API
@@ -135,7 +154,43 @@ DATABASE_URL="postgres:///warning_ledger?sslmode=disable" go run ./cmd/seed
 消息顺序：修订1 → 修订2 → 迟到修订1 → 修订1重复 → 修订3解除。
 预期：5 条消息产生 **3 个事件行 + 3 条 outbox**，当前状态为修订3解除，as-of 可回放任意时刻。
 
-### 5. 运行测试
+### 5. cn-met 场景：解除后重发 revision 4
+
+`cmd/seed-cnmet` 复现 `cn-met/rainstorm-2026-0801-hb-001` 的生命周期：rev1(yellow) → rev2(orange) → rev3(cancelled) → rev4(active, red, effective 10:15)，并重复提交 rev4 验证幂等。rev3 的解除记录**不被改写**，rev4 作为新事件追加，通知身份固定为 `cn-met/rainstorm-2026-0801-hb-001/4`。
+
+```bash
+DATABASE_URL="postgres:///warning_ledger?sslmode=disable" go run ./cmd/seed-cnmet
+```
+
+### 6. 启动投递 worker（可多实例并发）
+
+先启动一个下游接收端（测试用，按 `Idempotency-Key` 去重）：
+
+```bash
+go run ./cmd/mock-downstream -port 9900
+```
+
+再启动两个 worker（不同 `--worker-id`），它们会用 `FOR UPDATE SKIP LOCKED` 分摊队列：
+
+```bash
+DATABASE_URL="postgres:///warning_ledger?sslmode=disable" \
+  go run ./cmd/worker --worker-id=A --downstream-url=http://127.0.0.1:9900/notify &
+DATABASE_URL="postgres:///warning_ledger?sslmode=disable" \
+  go run ./cmd/worker --worker-id=B --downstream-url=http://127.0.0.1:9900/notify &
+```
+
+`--once` 处理完当前 pending 后退出。模拟"下游已接收但本地未写 `dispatched_at` 崩溃"：
+
+```bash
+# 1) 投递成功后立刻退出（事务回滚，本地仍是 pending）
+go run ./cmd/worker --worker-id=crash --crash-after-deliver \
+  --downstream-url=http://127.0.0.1:9900/notify --once
+# 2) 正常 worker 重放，沿用相同 notification_id，下游去重
+go run ./cmd/worker --worker-id=recovery \
+  --downstream-url=http://127.0.0.1:9900/notify --once
+```
+
+### 7. 运行测试
 
 ```bash
 # 领域纯逻辑单元测试（无需 DB）
