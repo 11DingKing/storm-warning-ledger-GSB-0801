@@ -32,6 +32,7 @@ type writeRequest struct {
 	ExpiresAt   time.Time      `json:"expires_at"`
 	RegionCodes []string       `json:"region_codes"`
 	Payload     map[string]any `json:"payload,omitempty"`
+	MaxAttempts int            `json:"max_attempts,omitempty"`
 }
 
 type errorResponse struct {
@@ -71,6 +72,7 @@ func (h *Handler) handleWrite(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:   req.ExpiresAt,
 		RegionCodes: req.RegionCodes,
 		Payload:     req.Payload,
+		MaxAttempts: req.MaxAttempts,
 	}
 
 	var opts service.WriteOptions

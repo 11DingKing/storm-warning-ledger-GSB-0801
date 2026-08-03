@@ -177,7 +177,7 @@ func (r *PostgresRepository) InsertEventTx(ctx context.Context, in domain.WriteI
 			return result, fmt.Errorf("forced failure before outbox write (simulating crash)")
 		}
 
-		outbox, insErr := insertOutboxInTx(ctx, tx, ev)
+		outbox, insErr := insertOutboxInTx(ctx, tx, ev, in.MaxAttempts)
 		if insErr != nil {
 			err = insErr
 			return result, err

@@ -40,7 +40,7 @@ func scanOutbox(row pgx.Row) (*domain.OutboxEvent, error) {
 	return &o, nil
 }
 
-func insertOutboxInTx(ctx context.Context, tx pgx.Tx, ev domain.WarningEvent) (*domain.OutboxEvent, error) {
+func insertOutboxInTx(ctx context.Context, tx pgx.Tx, ev domain.WarningEvent, maxAttempts int) (*domain.OutboxEvent, error) {
 	notificationID := domain.NotificationID(ev.Source, ev.ExternalID, ev.Revision)
 	outboxPayload := map[string]any{
 		"notification_id": notificationID,
@@ -56,14 +56,17 @@ func insertOutboxInTx(ctx context.Context, tx pgx.Tx, ev domain.WarningEvent) (*
 		"expires_at":      ev.ExpiresAt,
 		"region_codes":    ev.RegionCodes,
 	}
+	if maxAttempts <= 0 {
+		maxAttempts = 10
+	}
 	row := tx.QueryRow(ctx,
 		`INSERT INTO warning_outbox
-			(event_id, notification_id, aggregate_key, event_type, payload, status, available_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, now())
+			(event_id, notification_id, aggregate_key, event_type, payload, status, max_attempts, available_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, now())
 		 ON CONFLICT ON CONSTRAINT warning_outbox_notification_id_uniq DO NOTHING
 		 RETURNING `+outboxColumns,
 		ev.ID, notificationID, ev.AggregateKey(), string(ev.EventType),
-		marshalJSON(outboxPayload), domain.DispatchPending,
+		marshalJSON(outboxPayload), domain.DispatchPending, maxAttempts,
 	)
 	o, err := scanOutbox(row)
 	if errors.Is(err, pgx.ErrNoRows) {

@@ -110,6 +110,7 @@ type WriteInput struct {
 	ExpiresAt   time.Time      `json:"expires_at"`
 	RegionCodes []string       `json:"region_codes"`
 	Payload     map[string]any `json:"payload,omitempty"`
+	MaxAttempts int            `json:"max_attempts,omitempty"`
 }
 
 func (in *WriteInput) Validate() error {

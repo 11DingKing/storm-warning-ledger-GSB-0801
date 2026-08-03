@@ -354,6 +354,327 @@ func TestRetryFailureBackoff(t *testing.T) {
 	}
 }
 
+func TestRevision4LeaseExpiryTakenOverBySecondWorker(t *testing.T) {
+	svc, pool := setupSvc(t)
+	ctx := context.Background()
+	seedHubeiRevisions123(t, svc, ctx)
+	repo := repository.NewPostgresRepository(pool)
+
+	// Write revision 4.
+	effective4 := time.Date(2026, 8, 1, 10, 15, 0, 0, time.UTC)
+	in4 := hbInput(4, domain.SeverityRed, domain.StatusActive, effective4)
+	wr, err := svc.Write(ctx, in4, service.WriteOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wr.Outbox.NotificationID != "cn-met/rainstorm-2026-0801-hb-001/4" {
+		t.Fatalf("unexpected notification id: %s", wr.Outbox.NotificationID)
+	}
+	rev4OutboxID := wr.Outbox.ID
+
+	// Worker-1 claims rev4 and the lease expires (stale_timeout very short),
+	// but worker-1 crashes before marking dispatched. We simulate by claiming
+	// with a worker id and then NOT marking dispatched.
+	rows, err := repo.ClaimPending(ctx, "worker-1", 100, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rev4Claimed *domain.OutboxEvent
+	for i := range rows {
+		if rows[i].ID == rev4OutboxID {
+			rev4Claimed = &rows[i]
+		}
+	}
+	if rev4Claimed == nil {
+		t.Fatal("rev4 outbox row was not claimed")
+	}
+	if rev4Claimed.ClaimedBy != "worker-1" {
+		t.Errorf("claimed_by = %s, want worker-1", rev4Claimed.ClaimedBy)
+	}
+	if rev4Claimed.Attempts != 1 {
+		t.Errorf("attempts after first claim = %d, want 1", rev4Claimed.Attempts)
+	}
+
+	// Wait > stale timeout, then worker-2 takes over the stale lease.
+	time.Sleep(60 * time.Millisecond)
+	recovered, err := repo.ClaimPending(ctx, "worker-2", 100, 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rev4Recovered *domain.OutboxEvent
+	for i := range recovered {
+		if recovered[i].ID == rev4OutboxID {
+			rev4Recovered = &recovered[i]
+		}
+	}
+	if rev4Recovered == nil {
+		t.Fatal("worker-2 did not recover the stale rev4 row")
+	}
+	if rev4Recovered.ClaimedBy != "worker-2" {
+		t.Errorf("after recovery claimed_by = %s, want worker-2", rev4Recovered.ClaimedBy)
+	}
+	if rev4Recovered.Attempts != 2 {
+		t.Errorf("attempts after recovery = %d, want 2", rev4Recovered.Attempts)
+	}
+	// Same notification identity throughout.
+	if rev4Recovered.NotificationID != rev4Claimed.NotificationID {
+		t.Errorf("notification id changed during recovery: %s -> %s",
+			rev4Claimed.NotificationID, rev4Recovered.NotificationID)
+	}
+
+	// Worker-2 successfully dispatches.
+	ok, err := repo.MarkDispatched(ctx, rev4OutboxID, "worker-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("worker-2 should own the row and mark dispatched")
+	}
+
+	// Worker-1 (stale owner) must NOT be able to overwrite the dispatch.
+	ok, err = repo.MarkDispatched(ctx, rev4OutboxID, "worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Error("stale worker-1 must not be able to mark dispatched after worker-2 took over")
+	}
+
+	// There must still be exactly ONE outbox row for rev4 — one business
+	// notification with a stable identity, despite the lease transfer.
+	var rowCount int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM warning_outbox WHERE notification_id=$1`,
+		"cn-met/rainstorm-2026-0801-hb-001/4",
+	).Scan(&rowCount); err != nil {
+		t.Fatal(err)
+	}
+	if rowCount != 1 {
+		t.Errorf("expected exactly 1 outbox row for rev4, got %d", rowCount)
+	}
+
+	var finalStatus string
+	var finalAttempts int
+	if err := pool.QueryRow(ctx,
+		`SELECT status, attempts FROM warning_outbox WHERE id=$1`, rev4OutboxID,
+	).Scan(&finalStatus, &finalAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if finalStatus != string(domain.DispatchDispatched) {
+		t.Errorf("final status = %s, want dispatched", finalStatus)
+	}
+}
+
+func TestPoisonMessageFailsAfterThreeAttempts(t *testing.T) {
+	svc, pool := setupSvc(t)
+	ctx := context.Background()
+
+	// A warning whose downstream always fails, with max_attempts=3.
+	base := time.Date(2026, 8, 2, 9, 0, 0, 0, time.UTC)
+	in := domain.WriteInput{
+		Source:      "cn-met",
+		ExternalID:  "delivery-poison-01",
+		Revision:    1,
+		WarningType: domain.WarningTypeHail,
+		Severity:    domain.SeverityRed,
+		Status:      domain.StatusActive,
+		IssuedAt:    base,
+		EffectiveAt: base,
+		ExpiresAt:   base.Add(3 * time.Hour),
+		RegionCodes: []string{"420000"},
+		MaxAttempts: 3,
+	}
+	wr, err := svc.Write(ctx, in, service.WriteOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifID := wr.Outbox.NotificationID
+	if notifID != "cn-met/delivery-poison-01/1" {
+		t.Fatalf("notification id = %s", notifID)
+	}
+	if wr.Outbox.MaxAttempts != 3 {
+		t.Errorf("max_attempts = %d, want 3", wr.Outbox.MaxAttempts)
+	}
+
+	repo := repository.NewPostgresRepository(pool)
+
+	// Run a worker with a fast poll and short stale timeout; the dispatcher
+	// always returns an error. Force the backoff to be near-zero by setting
+	// available_at manually after each failure (we simulate three attempts
+	// deterministically through the repository instead of relying on timing).
+	alwaysFail := dispatch.Func(func(_ context.Context, _ domain.OutboxEvent) error {
+		return errors.New("downstream permanently broken")
+	})
+
+	opts := dispatch.DefaultOptions("poison-worker")
+	opts.PollInterval = 10 * time.Millisecond
+	opts.StaleTimeout = time.Hour
+	w := dispatch.NewWorker(opts, repo, alwaysFail)
+	w.Start(ctx)
+	defer w.Stop()
+
+	// After each failed attempt the row moves to 'retry' with a future
+	// available_at (exponential backoff). To drive three attempts quickly we
+	// repeatedly reset available_at to the past.
+	waitUntil(t, 3*time.Second, func() bool {
+		var attempts int
+		_ = pool.QueryRow(ctx,
+			`SELECT attempts FROM warning_outbox WHERE notification_id=$1`, notifID,
+		).Scan(&attempts)
+		if attempts < 3 {
+			// Reset backoff so the worker can claim again immediately.
+			_, _ = pool.Exec(ctx,
+				`UPDATE warning_outbox SET available_at=now() WHERE notification_id=$1 AND status='retry'`,
+				notifID)
+		}
+		return attempts >= 3
+	})
+	w.Stop()
+
+	var status string
+	var attempts int
+	var lastError string
+	if err := pool.QueryRow(ctx,
+		`SELECT status, attempts, COALESCE(last_error,'') FROM warning_outbox WHERE notification_id=$1`,
+		notifID,
+	).Scan(&status, &attempts, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(domain.DispatchFailed) {
+		t.Errorf("poison message final status = %s, want failed", status)
+	}
+	if attempts != 3 {
+		t.Errorf("poison message attempts = %d, want 3", attempts)
+	}
+	if lastError == "" {
+		t.Error("last_error should record the failure cause")
+	}
+
+	// The terminal 'failed' state must be queryable through the service/API.
+	ob, err := svc.GetOutboxNotification(ctx, notifID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ob.Status != domain.DispatchFailed {
+		t.Errorf("queried status = %s, want failed", ob.Status)
+	}
+	if ob.Attempts != 3 {
+		t.Errorf("queried attempts = %d, want 3", ob.Attempts)
+	}
+}
+
+func TestAsOfAfterRev3CancelAndRev4Reactivate(t *testing.T) {
+	svc, pool := setupSvc(t)
+	ctx := context.Background()
+	seedHubeiRevisions123(t, svc, ctx)
+
+	// Record the received_at of rev3 before writing rev4.
+	var rev3ReceivedAt time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT received_at FROM warning_events
+		 WHERE source=$1 AND external_id=$2 AND revision=3`,
+		hbSource, hbExtID,
+	).Scan(&rev3ReceivedAt); err != nil {
+		t.Fatal(err)
+	}
+
+	// Small pause so rev4's received_at is strictly after.
+	time.Sleep(10 * time.Millisecond)
+	effective4 := time.Date(2026, 8, 1, 10, 15, 0, 0, time.UTC)
+	if _, err := svc.Write(ctx, hbInput(4, domain.SeverityRed, domain.StatusActive, effective4), service.WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// as_of right after rev3 (and before rev4): state should be cancelled.
+	asOfAfterRev3 := rev3ReceivedAt.Add(time.Millisecond)
+	state3, err := svc.GetAsOf(ctx, hbSource, hbExtID, asOfAfterRev3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state3.Revision != 3 || state3.Status != domain.StatusCancelled {
+		t.Errorf("as-of after rev3 should be rev3/cancelled, got rev%d/%s",
+			state3.Revision, state3.Status)
+	}
+
+	// as_of after rev4: state should be active/red/rev4.
+	asOfAfterRev4 := time.Now().Add(time.Second)
+	state4, err := svc.GetAsOf(ctx, hbSource, hbExtID, asOfAfterRev4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state4.Revision != 4 || state4.Status != domain.StatusActive || state4.Severity != domain.SeverityRed {
+		t.Errorf("as-of after rev4 should be rev4/active/red, got rev%d/%s/%s",
+			state4.Revision, state4.Status, state4.Severity)
+	}
+	if !state4.EffectiveAt.Equal(effective4) {
+		t.Errorf("effective_at = %s, want %s", state4.EffectiveAt, effective4)
+	}
+}
+
+func TestHistoryUnaffectedByDeliveryRetries(t *testing.T) {
+	svc, pool := setupSvc(t)
+	ctx := context.Background()
+	seedHubeiRevisions123(t, svc, ctx)
+	repo := repository.NewPostgresRepository(pool)
+
+	// Run a failing worker that retries rev1 multiple times by resetting
+	// backoff; this must not add or modify any warning_events rows.
+	base := time.Date(2026, 8, 1, 8, 0, 0, 0, time.UTC)
+	if _, err := svc.Write(ctx, hbInput(4, domain.SeverityRed, domain.StatusActive, base.Add(2*time.Hour+15*time.Minute)), service.WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	historyBefore, err := svc.GetHistory(ctx, hbSource, hbExtID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeIDs := make([]int64, len(historyBefore))
+	for i, e := range historyBefore {
+		beforeIDs[i] = e.ID
+	}
+
+	alwaysFail := dispatch.Func(func(_ context.Context, _ domain.OutboxEvent) error {
+		return errors.New("nope")
+	})
+	opts := dispatch.DefaultOptions("history-worker")
+	opts.PollInterval = 10 * time.Millisecond
+	opts.StaleTimeout = time.Hour
+	w := dispatch.NewWorker(opts, repo, alwaysFail)
+	w.Start(ctx)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_, _ = pool.Exec(ctx,
+			`UPDATE warning_outbox SET available_at=now() WHERE status='retry'`)
+		time.Sleep(20 * time.Millisecond)
+	}
+	w.Stop()
+
+	historyAfter, err := svc.GetHistory(ctx, hbSource, hbExtID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(historyAfter) != len(historyBefore) {
+		t.Fatalf("history length changed after retries: %d -> %d",
+			len(historyBefore), len(historyAfter))
+	}
+	for i, e := range historyAfter {
+		if e.ID != beforeIDs[i] {
+			t.Errorf("history[%d].id changed after delivery retries: %d -> %d",
+				i, beforeIDs[i], e.ID)
+		}
+	}
+	// Outbox attempts should have advanced (proving retries happened).
+	var totalAttempts int
+	_ = pool.QueryRow(ctx,
+		`SELECT COALESCE(SUM(attempts),0) FROM warning_outbox WHERE aggregate_key=$1`,
+		hbSource+":"+hbExtID,
+	).Scan(&totalAttempts)
+	if totalAttempts <= 4 {
+		t.Errorf("expected delivery retries to increment attempts beyond initial claims, got %d", totalAttempts)
+	}
+}
+
 func waitUntil(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

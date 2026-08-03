@@ -313,6 +313,12 @@ components:
         payload:
           type: object
           additionalProperties: true
+        max_attempts:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 10
+          description: Maximum delivery attempts before the outbox row moves to 'failed'.
 
     WarningEvent:
       type: object

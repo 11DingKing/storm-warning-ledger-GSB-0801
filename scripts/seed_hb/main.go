@@ -23,6 +23,7 @@ type payload struct {
 	ExpiresAt   time.Time      `json:"expires_at"`
 	RegionCodes []string       `json:"region_codes"`
 	Payload     map[string]any `json:"payload,omitempty"`
+	MaxAttempts int            `json:"max_attempts,omitempty"`
 }
 
 func main() {
@@ -108,6 +109,28 @@ func main() {
 
 	fmt.Println("\n=== Outbox for notification cn-met/rainstorm-2026-0801-hb-001/4 ===")
 	get(fmt.Sprintf("%s/api/v1/outbox/%s/%s/4", *api, source, extID))
+
+	fmt.Println("\n[6] Ingesting poison message delivery-poison-01 (max_attempts=3)...")
+	poisonTime := time.Date(2026, 8, 2, 9, 0, 0, 0, time.UTC)
+	poison := payload{
+		Source: "cn-met", ExternalID: "delivery-poison-01", Revision: 1,
+		WarningType: "hail", Severity: "red", Status: "active",
+		IssuedAt: poisonTime, EffectiveAt: poisonTime,
+		ExpiresAt: poisonTime.Add(3 * time.Hour),
+		RegionCodes: []string{"420000"},
+		MaxAttempts: 3,
+		Payload:     map[string]any{"poison": true},
+	}
+	pb, _ := json.Marshal(poison)
+	presp, err := http.Post(*api+"/api/v1/warnings", "application/json", bytes.NewReader(pb))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "poison request failed: %v\n", err)
+		os.Exit(1)
+	}
+	prb, _ := io.ReadAll(presp.Body)
+	presp.Body.Close()
+	fmt.Printf("-> HTTP %d: %s\n", presp.StatusCode, string(prb))
+	fmt.Println("   (a failing dispatcher will move it to 'failed' after 3 attempts)")
 }
 
 func get(u string) {
