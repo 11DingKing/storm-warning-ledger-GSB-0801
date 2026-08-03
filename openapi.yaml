@@ -1,0 +1,351 @@
+openapi: 3.0.3
+info:
+  title: Storm Warning Lifecycle API
+  version: "1.0.0"
+  description: >
+    Unified ingestion and query API for multi-province emergency storm warnings
+    (暴雨 rainstorm, 雷暴大风 thunderstorm-gale, 冰雹 hail). The write model is an
+    append-only event stream: revisions and cancellations only ever append new
+    events. Ingestion is idempotent on (source, external_id, revision), and a
+    late/lower revision is preserved for audit but never rolls back the current
+    effective state.
+servers:
+  - url: http://localhost:8080
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /v1/warnings:
+    post:
+      summary: Ingest one upstream warning message (append-only, idempotent)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IngestRequest"
+      responses:
+        "201":
+          description: >
+            A new event was appended. outcome is "applied" when it advanced the
+            current state, or "superseded" when it was a previously-unseen lower
+            revision appended for the audit trail without changing current state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestResult"
+        "200":
+          description: >
+            Idempotent no-op. An event with this (source, external_id, revision)
+            already existed; nothing was appended. outcome is "duplicate".
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestResult"
+        "400":
+          description: Malformed JSON body
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: Validation failed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ValidationError" }
+    get:
+      summary: Search current warning states (deterministic ordering)
+      parameters:
+        - in: query
+          name: status
+          schema: { type: string, enum: [active, updated, cancelled, expired] }
+        - in: query
+          name: severity
+          schema: { type: string, enum: [minor, moderate, severe, extreme, blue, yellow, orange, red] }
+        - in: query
+          name: region_code
+          schema: { type: string }
+          description: Matches warnings whose region_codes contains this code.
+        - in: query
+          name: limit
+          schema: { type: integer, default: 100, maximum: 500 }
+        - in: query
+          name: offset
+          schema: { type: integer, default: 0 }
+      responses:
+        "200":
+          description: >
+            Matching current states, always ordered by (source, external_id)
+            ascending so pagination and comparisons are stable.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+                  results:
+                    type: array
+                    items: { $ref: "#/components/schemas/CurrentState" }
+
+  /v1/warnings/{source}/{external_id}:
+    get:
+      summary: Get current effective state, or point-in-time state via as_of
+      parameters:
+        - in: path
+          name: source
+          required: true
+          schema: { type: string }
+        - in: path
+          name: external_id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: as_of
+          required: false
+          schema: { type: string, format: date-time }
+          description: >
+            RFC3339 timestamp. When present, returns the effective state as it
+            would have been known using only events received on or before this
+            instant (highest revision within that subset wins).
+      responses:
+        "200":
+          description: Current (or as-of) state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CurrentState" }
+        "400":
+          description: Invalid as_of value
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: Unknown warning / nothing known as of that time
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/warnings/{source}/{external_id}/events:
+    get:
+      summary: Full append-only event history in stable insertion order
+      parameters:
+        - in: path
+          name: source
+          required: true
+          schema: { type: string }
+        - in: path
+          name: external_id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Ordered events (ascending id)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  source: { type: string }
+                  external_id: { type: string }
+                  events:
+                    type: array
+                    items: { $ref: "#/components/schemas/StoredEvent" }
+
+  /v1/outbox/dead:
+    get:
+      summary: List the dead-letter queue (terminal delivery failures)
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, default: 100, maximum: 500 }
+      responses:
+        "200":
+          description: Notifications that exhausted their retries.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+                  dead_letters:
+                    type: array
+                    items: { $ref: "#/components/schemas/OutboxRecord" }
+
+  /v1/outbox/{notification_id}:
+    get:
+      summary: Fetch one outbox record by its stable notification identity
+      parameters:
+        - in: path
+          name: notification_id
+          required: true
+          schema: { type: string }
+          description: >
+            The full identity, e.g. cn-met/rainstorm-2026-0801-hb-001/4. It
+            contains slashes, matched as a trailing wildcard path segment.
+      responses:
+        "200":
+          description: The outbox record
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OutboxRecord" }
+        "404":
+          description: Unknown notification
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+components:
+  schemas:
+    IngestRequest:
+      type: object
+      required:
+        - source
+        - external_id
+        - revision
+        - severity
+        - status
+        - issued_at
+        - effective_at
+        - expires_at
+        - region_codes
+      properties:
+        source: { type: string, example: cma-guangdong }
+        external_id: { type: string, example: GD-RAIN-2026-0007 }
+        revision: { type: integer, minimum: 0, example: 1 }
+        severity: { type: string, enum: [minor, moderate, severe, extreme, blue, yellow, orange, red] }
+        status: { type: string, enum: [active, updated, cancelled, expired] }
+        issued_at: { type: string, format: date-time }
+        effective_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        region_codes:
+          type: array
+          items: { type: string }
+          example: ["440100", "440300"]
+        payload:
+          type: object
+          additionalProperties: true
+    IngestResult:
+      type: object
+      properties:
+        outcome:
+          type: string
+          enum: [applied, superseded, duplicate]
+        event:
+          $ref: "#/components/schemas/StoredEvent"
+        outbox:
+          $ref: "#/components/schemas/OutboxRecord"
+        current:
+          $ref: "#/components/schemas/CurrentState"
+    OutboxRecord:
+      type: object
+      description: >
+        A notification queued for at-least-once downstream delivery. On a
+        duplicate ingest the FIRST event and this FIRST outbox record are
+        returned unchanged.
+      properties:
+        id: { type: integer, format: int64 }
+        event_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: Null for synthetic (event-less) notifications.
+        notification_id:
+          type: string
+          description: >
+            Stable delivery identity "<source>/<external_id>/<revision>", e.g.
+            cn-met/rainstorm-2026-0801-hb-001/4. It never changes across
+            redelivery, so an idempotent downstream can de-duplicate.
+          example: cn-met/rainstorm-2026-0801-hb-001/4
+        topic: { type: string, example: warning.applied }
+        payload:
+          type: object
+          additionalProperties: true
+        status:
+          type: string
+          enum: [pending, delivered, dead]
+          description: >
+            Delivery lifecycle: pending (owed), delivered (terminal success),
+            dead (terminal failure after max_attempts).
+        attempts: { type: integer }
+        max_attempts: { type: integer }
+        dispatched_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Set only after a successful downstream delivery.
+        dead_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Set when the row entered the terminal dead state.
+        lease_expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: >
+            While in the future, the row is leased by claimed_by and cannot be
+            claimed by another worker; takeover is possible only after expiry.
+        next_attempt_at: { type: string, format: date-time }
+        last_error: { type: string }
+        claimed_by: { type: string }
+        created_at: { type: string, format: date-time }
+    StoredEvent:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        event_uid: { type: string, format: uuid }
+        source: { type: string }
+        external_id: { type: string }
+        revision: { type: integer }
+        severity: { type: string }
+        status: { type: string }
+        issued_at: { type: string, format: date-time }
+        effective_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        region_codes:
+          type: array
+          items: { type: string }
+        payload:
+          type: object
+          additionalProperties: true
+        received_at: { type: string, format: date-time }
+    CurrentState:
+      type: object
+      properties:
+        source: { type: string }
+        external_id: { type: string }
+        revision: { type: integer }
+        severity: { type: string }
+        status: { type: string }
+        issued_at: { type: string, format: date-time }
+        effective_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        region_codes:
+          type: array
+          items: { type: string }
+        first_seen_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        message: { type: string }
+    ValidationError:
+      type: object
+      properties:
+        error: { type: string, example: validation_failed }
+        fields:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
