@@ -1,0 +1,484 @@
+openapi: 3.0.3
+info:
+  title: Storm Warning Ledger API
+  description: |
+    Multi-province storm warning ingestion service. Provides an append-only event
+    stream for rain, thunderstorm wind and hail warnings, handling duplicate,
+    out-of-order and late revisions without ever overwriting or deleting history.
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+paths:
+  /health:
+    get:
+      summary: Liveness probe
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+  /api/v1/warnings:
+    post:
+      summary: Ingest a warning revision
+      description: |
+        Append-only write. The triple (source, external_id, revision) is idempotent.
+        Lower revisions arriving late are recorded with `is_late=true` but do not
+        roll back the current effective state. The event and its outbox notification
+        are written atomically in a single transaction.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WriteWarningRequest'
+      parameters:
+        - name: fail_before_outbox
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: |
+            Test hook. When true, the transaction is forced to fail after the event
+            insert but before the outbox insert, proving that event and notification
+            commit or roll back together.
+      responses:
+        '201':
+          description: New revision applied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WriteOutcome'
+        '200':
+          description: Duplicate revision (idempotent replay)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WriteOutcome'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      summary: List current effective warnings
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/Status'
+        - name: warning_type
+          in: query
+          schema:
+            $ref: '#/components/schemas/WarningType'
+        - name: source
+          in: query
+          schema:
+            type: string
+        - name: region_code
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Paged list of current warning states
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WarningList'
+
+  /api/v1/warnings/{source}/{externalID}:
+    get:
+      summary: Get current effective state of a warning
+      parameters:
+        - name: source
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: externalID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: as_of
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: |
+            RFC3339 timestamp. If supplied, reconstructs the state as it was at
+            that moment by replaying events whose `received_at <= as_of`, always
+            taking the highest revision seen so far.
+      responses:
+        '200':
+          description: Current or historical state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WarningState'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/warnings/{source}/{externalID}/history:
+    get:
+      summary: Full append-only event history for a warning
+      parameters:
+        - name: source
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: externalID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Events sorted by (revision, id)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HistoryResponse'
+
+  /api/v1/outbox:
+    get:
+      summary: List notification outbox rows (most recent first)
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        '200':
+          description: Outbox rows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OutboxEvent'
+                  total:
+                    type: integer
+
+  /api/v1/outbox/{notificationID}:
+    get:
+      summary: Get a single outbox notification by its stable identity
+      description: |
+        The notification identity is deterministic:
+        `source/external_id/revision` (e.g.
+        `cn-met/rainstorm-2026-0801-hb-001/4`). It stays the same across
+        retries, crash recovery and duplicate revision submissions.
+      parameters:
+        - name: notificationID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Outbox notification
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutboxEvent'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  responses:
+    BadRequest:
+      description: Invalid input
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Warning not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalError:
+      description: Server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+
+    WarningType:
+      type: string
+      enum: [rain, thunderstorm_wind, hail]
+
+    Severity:
+      type: string
+      enum: [blue, yellow, orange, red]
+
+    Status:
+      type: string
+      enum: [active, cancelled, expired]
+
+    EventType:
+      type: string
+      enum: [update, cancel]
+
+    WriteResult:
+      type: string
+      enum: [applied, duplicate, late]
+
+    WriteWarningRequest:
+      type: object
+      required:
+        - source
+        - external_id
+        - revision
+        - warning_type
+        - severity
+        - status
+        - issued_at
+        - effective_at
+        - expires_at
+        - region_codes
+      properties:
+        source:
+          type: string
+          example: cma
+        external_id:
+          type: string
+          example: WARN-2026-001
+        revision:
+          type: integer
+          minimum: 1
+          example: 2
+        warning_type:
+          $ref: '#/components/schemas/WarningType'
+        severity:
+          $ref: '#/components/schemas/Severity'
+        status:
+          $ref: '#/components/schemas/Status'
+        issued_at:
+          type: string
+          format: date-time
+        effective_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        region_codes:
+          type: array
+          items:
+            type: string
+          example: ["110000", "120000"]
+        payload:
+          type: object
+          additionalProperties: true
+        max_attempts:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 10
+          description: Maximum delivery attempts before the outbox row moves to 'failed'.
+
+    WarningEvent:
+      type: object
+      properties:
+        id:
+          type: integer
+        source:
+          type: string
+        external_id:
+          type: string
+        revision:
+          type: integer
+        event_type:
+          $ref: '#/components/schemas/EventType'
+        warning_type:
+          $ref: '#/components/schemas/WarningType'
+        severity:
+          $ref: '#/components/schemas/Severity'
+        status:
+          $ref: '#/components/schemas/Status'
+        issued_at:
+          type: string
+          format: date-time
+        effective_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        region_codes:
+          type: array
+          items:
+            type: string
+        payload:
+          type: object
+          additionalProperties: true
+        is_late:
+          type: boolean
+        received_at:
+          type: string
+          format: date-time
+
+    WriteOutcome:
+      type: object
+      properties:
+        event:
+          $ref: '#/components/schemas/WarningEvent'
+        outbox:
+          $ref: '#/components/schemas/OutboxEvent'
+        result:
+          $ref: '#/components/schemas/WriteResult'
+        current_revision:
+          type: integer
+
+    DispatchStatus:
+      type: string
+      enum: [pending, claimed, dispatched, retry, failed]
+
+    OutboxEvent:
+      type: object
+      properties:
+        id:
+          type: integer
+        event_id:
+          type: integer
+        notification_id:
+          type: string
+          description: Stable identity `source/external_id/revision`, identical across retries and replays.
+          example: cn-met/rainstorm-2026-0801-hb-001/4
+        aggregate_key:
+          type: string
+        event_type:
+          $ref: '#/components/schemas/EventType'
+        payload:
+          type: object
+          additionalProperties: true
+        status:
+          $ref: '#/components/schemas/DispatchStatus'
+        attempts:
+          type: integer
+        max_attempts:
+          type: integer
+        claimed_by:
+          type: string
+        claimed_at:
+          type: string
+          format: date-time
+        dispatched_at:
+          type: string
+          format: date-time
+        available_at:
+          type: string
+          format: date-time
+        last_error:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    WarningState:
+      type: object
+      properties:
+        source:
+          type: string
+        external_id:
+          type: string
+        revision:
+          type: integer
+        warning_type:
+          $ref: '#/components/schemas/WarningType'
+        severity:
+          $ref: '#/components/schemas/Severity'
+        status:
+          $ref: '#/components/schemas/Status'
+        issued_at:
+          type: string
+          format: date-time
+        effective_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        region_codes:
+          type: array
+          items:
+            type: string
+        payload:
+          type: object
+          additionalProperties: true
+        last_event_id:
+          type: integer
+        updated_at:
+          type: string
+          format: date-time
+
+    HistoryResponse:
+      type: object
+      properties:
+        source:
+          type: string
+        external_id:
+          type: string
+        total:
+          type: integer
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/WarningEvent'
+
+    WarningList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/WarningState'
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
